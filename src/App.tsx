@@ -1,5 +1,4 @@
 import { useState, useEffect } from "react";
-import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import TranscriptionWindow from "./TranscriptionWindow";
@@ -7,8 +6,6 @@ import { SettingsDialog } from "./SettingsDialog";
 import "./App.css";
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
   const [windowLabel, setWindowLabel] = useState("");
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
@@ -16,65 +13,52 @@ function App() {
     const getLabel = async () => {
       const window = getCurrentWindow();
       setWindowLabel(window.label);
+      
+      // If this is the main window, automatically open settings
+      if (window.label === "main") {
+        setIsSettingsOpen(true);
+        
+        // Listen for window close event to hide from dock
+        const unlisten = await window.onCloseRequested(async (event) => {
+          // Prevent default close behavior
+          event.preventDefault();
+          
+          // Hide the window instead of closing
+          await window.hide();
+          
+          // Hide app from dock by invoking a backend command
+          try {
+            await invoke("hide_from_dock");
+          } catch (e) {
+            console.error("Failed to hide from dock:", e);
+          }
+        });
+        
+        return () => {
+          unlisten();
+        };
+      }
     };
     getLabel();
   }, []);
-
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
 
   // Render transcription window if this is the transcription window
   if (windowLabel === "transcription") {
     return <TranscriptionWindow />;
   }
 
-  // Otherwise render the main app
+  // Otherwise render the main app (settings window)
   return (
     <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vitejs.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://reactjs.org" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-
-      {/* Settings Button */}
-      <div className="row" style={{ marginTop: '20px' }}>
-        <button onClick={() => setIsSettingsOpen(true)}>
-          Open Settings
-        </button>
-      </div>
-
-      {/* Settings Dialog */}
+      {/* Settings Dialog - auto-opens when window is shown */}
       <SettingsDialog 
         isOpen={isSettingsOpen} 
-        onClose={() => setIsSettingsOpen(false)} 
+        onClose={() => {
+          setIsSettingsOpen(false);
+          // Close the window when settings dialog is closed
+          getCurrentWindow().hide();
+          invoke("hide_from_dock").catch(e => console.error("Failed to hide from dock:", e));
+        }} 
       />
     </main>
   );

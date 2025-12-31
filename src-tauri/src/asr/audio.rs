@@ -4,6 +4,8 @@ use crossbeam_channel::Sender;
 use ringbuf::traits::Producer;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
+use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
+use std::sync::{Arc, Mutex};
 
 pub const SAMPLE_RATE: u32 = 16000;
 pub const CHANNELS: u16 = 1;
@@ -55,6 +57,27 @@ impl AudioChunk {
 pub struct AudioRecorder {
     sample_rate: u32,
     device: Option<cpal::Device>,
+}
+
+/// Create a resampler for converting from one sample rate to another
+fn create_resampler(from_rate: u32, to_rate: u32) -> Result<SincFixedIn<f32>> {
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    
+    let resampler = SincFixedIn::<f32>::new(
+        to_rate as f64 / from_rate as f64,
+        2.0, // max_resample_ratio_relative
+        params,
+        1024, // chunk_size
+        1,    // num_channels
+    )?;
+    
+    Ok(resampler)
 }
 
 impl AudioRecorder {
@@ -177,22 +200,41 @@ impl AudioRecorder {
             .unwrap_or_else(|_| "Unknown".to_string());
         info!("Using input device: {}", device_name);
 
-        // Try to get supported config
+        // Get the device's default config to find native sample rate
+        let default_config = input_device.default_input_config()
+            .context("Failed to get default input config")?;
+        let native_sample_rate = default_config.sample_rate();
+        // native_sample_rate is already u32 in cpal 0.17
+        
+        info!("Device native sample rate: {}Hz, target: {}Hz", 
+              native_sample_rate, self.sample_rate);
+
+        // Log supported configs for debugging
         let supported_configs = input_device.supported_input_configs()
             .context("Failed to get supported input configs")?;
-
         info!("Supported input configs:");
         for config in supported_configs {
             info!("  - {:?}", config);
         }
 
+        // Use the native sample rate instead of forcing 16kHz
         let config = cpal::StreamConfig {
             channels: CHANNELS,
-            sample_rate: self.sample_rate.into(),
+            sample_rate: native_sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
-        info!("Attempting to use config: {:?}", config);
+        info!("Using config: {:?}", config);
+
+        // Create resampler if needed
+        let needs_resampling = native_sample_rate != self.sample_rate;
+        let resampler: Option<Arc<Mutex<SincFixedIn<f32>>>> = if needs_resampling {
+            info!("Creating resampler: {}Hz -> {}Hz", native_sample_rate, self.sample_rate);
+            Some(Arc::new(Mutex::new(create_resampler(native_sample_rate, self.sample_rate)?)))
+        } else {
+            info!("No resampling needed");
+            None
+        };
 
         let err_fn = |err| error!("Audio stream error: {}", err);
 
@@ -201,11 +243,40 @@ impl AudioRecorder {
             move |data: &[f32], info: &cpal::InputCallbackInfo| {
                 debug!("Received audio chunk with {} samples, timestamp: {:?}", data.len(), info.timestamp());
                 
-                // Push samples to ringbuf (non-blocking)
-                let pushed = producer.push_slice(data);
+                // Resample if needed
+                let samples_to_push = if let Some(ref resampler_arc) = resampler {
+                    let mut resampler = match resampler_arc.lock() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Failed to lock resampler: {}", e);
+                            return;
+                        }
+                    };
+                    
+                    // Prepare input for resampler (needs Vec<Vec<f32>> for multi-channel)
+                    let input_frames = vec![data.to_vec()];
+                    
+                    // Process resampling
+                    match resampler.process(&input_frames, None) {
+                        Ok(output_frames) => {
+                            // Extract the resampled data from the first channel
+                            output_frames[0].clone()
+                        }
+                        Err(e) => {
+                            error!("Resampling error: {}", e);
+                            return;
+                        }
+                    }
+                } else {
+                    // No resampling needed, use data as-is
+                    data.to_vec()
+                };
                 
-                if pushed < data.len() {
-                    warn!("Ringbuf full: dropped {} samples out of {}", data.len() - pushed, data.len());
+                // Push samples to ringbuf (non-blocking)
+                let pushed = producer.push_slice(&samples_to_push);
+                
+                if pushed < samples_to_push.len() {
+                    warn!("Ringbuf full: dropped {} samples out of {}", samples_to_push.len() - pushed, samples_to_push.len());
                 }
             },
             err_fn,
@@ -237,22 +308,41 @@ impl AudioRecorder {
             .unwrap_or_else(|_| "Unknown".to_string());
         info!("Using input device: {}", device_name);
 
-        // Try to get supported config
+        // Get the device's default config to find native sample rate
+        let default_config = input_device.default_input_config()
+            .context("Failed to get default input config")?;
+        let native_sample_rate = default_config.sample_rate();
+        // native_sample_rate is already u32 in cpal 0.17
+        
+        info!("Device native sample rate: {}Hz, target: {}Hz", 
+              native_sample_rate, self.sample_rate);
+
+        // Log supported configs for debugging
         let supported_configs = input_device.supported_input_configs()
             .context("Failed to get supported input configs")?;
-
         info!("Supported input configs:");
         for config in supported_configs {
             info!("  - {:?}", config);
         }
 
+        // Use the native sample rate instead of forcing 16kHz
         let config = cpal::StreamConfig {
             channels: CHANNELS,
-            sample_rate: self.sample_rate.into(),
+            sample_rate: native_sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
-        info!("Attempting to use config: {:?}", config);
+        info!("Using config: {:?}", config);
+
+        // Create resampler if needed
+        let needs_resampling = native_sample_rate != self.sample_rate;
+        let resampler: Option<Arc<Mutex<SincFixedIn<f32>>>> = if needs_resampling {
+            info!("Creating resampler: {}Hz -> {}Hz", native_sample_rate, self.sample_rate);
+            Some(Arc::new(Mutex::new(create_resampler(native_sample_rate, self.sample_rate)?)))
+        } else {
+            info!("No resampling needed");
+            None
+        };
 
         let err_fn = |err| error!("Audio stream error: {}", err);
 
@@ -260,8 +350,38 @@ impl AudioRecorder {
             &config,
             move |data: &[f32], info: &cpal::InputCallbackInfo| {
                 debug!("Received audio chunk with {} samples, timestamp: {:?}", data.len(), info.timestamp());
-                // Send audio data immediately without buffering
-                let chunk = AudioChunk::new(data.to_vec());
+                
+                // Resample if needed
+                let samples = if let Some(ref resampler_arc) = resampler {
+                    let mut resampler = match resampler_arc.lock() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("Failed to lock resampler: {}", e);
+                            return;
+                        }
+                    };
+                    
+                    // Prepare input for resampler (needs Vec<Vec<f32>> for multi-channel)
+                    let input_frames = vec![data.to_vec()];
+                    
+                    // Process resampling
+                    match resampler.process(&input_frames, None) {
+                        Ok(output_frames) => {
+                            // Extract the resampled data from the first channel
+                            output_frames[0].clone()
+                        }
+                        Err(e) => {
+                            error!("Resampling error: {}", e);
+                            return;
+                        }
+                    }
+                } else {
+                    // No resampling needed, use data as-is
+                    data.to_vec()
+                };
+                
+                // Send audio data
+                let chunk = AudioChunk::new(samples);
                 
                 if let Err(e) = tx.send(chunk) {
                     error!("Failed to send audio chunk: {}", e);

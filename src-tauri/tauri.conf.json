@@ -13,10 +13,14 @@
     "windows": [
       {
         "label": "main",
-        "title": "unterwhisper",
-        "width": 800,
-        "height": 600,
-        "visible": false
+        "title": "Unterwhisper Settings",
+        "width": 600,
+        "height": 500,
+        "center": true,
+        "visible": false,
+        "resizable": true,
+        "minimizable": true,
+        "closable": true
       },
       {
         "label": "transcription",

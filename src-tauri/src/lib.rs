@@ -425,6 +425,29 @@ fn handle_start_recording(app: &tauri::AppHandle) {
     }
 }
 
+/// Handle the "Settings" menu item
+fn handle_settings(app: &tauri::AppHandle) {
+    info!("Settings triggered from menu");
+    debug!("=== TRAY MENU: SETTINGS CLICKED ===");
+
+    // Temporarily show app in dock when settings window is open
+    app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
+    // Show and focus the settings window
+    if let Some(window) = app.get_webview_window("main") {
+        if let Err(e) = window.show() {
+            error!("Failed to show settings window: {}", e);
+        }
+        if let Err(e) = window.set_focus() {
+            error!("Failed to focus settings window: {}", e);
+        }
+        debug!("=== TRAY MENU: SETTINGS SUCCESS ===");
+    } else {
+        error!("Settings window not found");
+        debug!("=== TRAY MENU: SETTINGS FAILED ===");
+    }
+}
+
 /// Handle the "Quit" menu item
 fn handle_quit(_app: &tauri::AppHandle) {
     info!("Quit triggered from menu");
@@ -575,6 +598,14 @@ fn manual_stop_recording(state: tauri::State<AppState>, app: tauri::AppHandle) -
     stop_recording(&state, &app)
 }
 
+/// Hide app from dock (macOS only)
+#[tauri::command]
+fn hide_from_dock(app: tauri::AppHandle) -> Result<(), String> {
+    info!("Hiding app from dock");
+    app.set_activation_policy(tauri::ActivationPolicy::Prohibited);
+    Ok(())
+}
+
 pub fn run() {
     eprintln!("🦉🦉🦉🦉🦉🦉🦉🦉 UNTER WHISPER STARTING 🦉🦉🦉🦉🦉🦉🦉🦉");
     eprintln!("Debug logging enabled");
@@ -613,7 +644,8 @@ pub fn run() {
             update_settings,
             get_audio_devices,
             manual_start_recording,
-            manual_stop_recording
+            manual_stop_recording,
+            hide_from_dock
         ])
         .setup(move |app| {
             // Set up logging with file output
@@ -657,6 +689,10 @@ pub fn run() {
                     &tauri::menu::MenuItemBuilder::with_id("start_recording", "Start Recording")
                         .build(app)?,
                 )
+                .item(
+                    &tauri::menu::MenuItemBuilder::with_id("settings", "Settings")
+                        .build(app)?,
+                )
                 .separator()
                 .item(
                     &tauri::menu::MenuItemBuilder::with_id("quit", "Quit")
@@ -677,6 +713,10 @@ pub fn run() {
                         "start_recording" => {
                             debug!("Tray menu: 'start_recording' selected");
                             handle_start_recording(app);
+                        }
+                        "settings" => {
+                            debug!("Tray menu: 'settings' selected");
+                            handle_settings(app);
                         }
                         "quit" => {
                             debug!("Tray menu: 'quit' selected");
