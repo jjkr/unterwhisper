@@ -39,9 +39,9 @@
 //! }
 //! ```
 
-use crate::audio::{AudioChunk, AudioRecorder, SAMPLE_RATE};
-use crate::dsp::{self, fft};
-use crate::whisper::WhisperTransformer;
+use crate::asr::audio::{AudioChunk, AudioRecorder, SAMPLE_RATE};
+use crate::asr::dsp::{self, fft};
+use crate::asr::whisper::WhisperTransformer;
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use core::f32;
