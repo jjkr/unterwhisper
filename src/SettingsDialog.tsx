@@ -38,6 +38,14 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     'medium',
     'large-v2',
     'large-v3',
+    'large-v3-turbo',
+    'large-v3-turbo-q41-gguf',
+    'large-v3-turbo-q4k-gguf',
+    'distil-small.en',
+    'distil-medium.en',
+    'distil-large-v3',
+    'distil-large-v3.5',
+    'parakeet-tdt-0.6b-v3',
   ];
 
   // Available languages (null means auto-detect)

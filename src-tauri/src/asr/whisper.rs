@@ -6,8 +6,13 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 use log::{debug, info};
 
+enum WhisperModel {
+    Normal(m::model::Whisper),
+    Quantized(m::quantized_model::Whisper),
+}
+
 pub struct WhisperTransformer {
-    model: m::model::Whisper,
+    model: WhisperModel,
     tokenizer: Tokenizer,
     device: Device,
     config: Config,
@@ -19,26 +24,35 @@ impl WhisperTransformer {
 
         // Download model files from huggingface
         let api = Api::new()?;
-        let (model_id, revision) = Self::get_model_info(model_name);
+        let (model_id, revision, model_file) = Self::get_model_info(model_name);
         info!("model_id: {} revision: {}", model_id, revision);
         let repo = api.repo(Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string()));
         info!("Got repo {}", repo.url("config.json"));
 
         let config_filename = repo.get("config.json")?;
         let tokenizer_filename = repo.get("tokenizer.json")?;
-        let weights_filename = repo.get("model.safetensors")?;
+        let weights_filename = repo.get(model_file)?;
 
         // Load config and tokenizer
         let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
         let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(anyhow::Error::msg)?;
 
-        // Load model
-        let vb = unsafe { 
-            VarBuilder::from_mmaped_safetensors(&[weights_filename], m::DTYPE, &device)? 
+        // Load model based on file extension
+        let model = if model_file.ends_with(".gguf") {
+            info!("Loading GGUF quantized model");
+            let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(&weights_filename, &device)?;
+            let quantized_model = m::quantized_model::Whisper::load(&vb, config.clone())?;
+            WhisperModel::Quantized(quantized_model)
+        } else {
+            info!("Loading safetensors model");
+            let vb = unsafe { 
+                VarBuilder::from_mmaped_safetensors(&[weights_filename], m::DTYPE, &device)? 
+            };
+            let normal_model = m::model::Whisper::load(&vb, config.clone())?;
+            WhisperModel::Normal(normal_model)
         };
 
-        info!("Loading normal Whisper model");
-        let model = m::model::Whisper::load(&vb, config.clone())?;
+        info!("Whisper model loaded successfully");
 
         Ok(Self {
             model,
@@ -52,25 +66,27 @@ impl WhisperTransformer {
         &self.config
     }
     
-    fn get_model_info(model_name: &str) -> (&'static str, &'static str) {
+    fn get_model_info(model_name: &str) -> (&'static str, &'static str, &'static str) {
         match model_name {
-            "tiny" => ("openai/whisper-tiny", "main"),
-            "tiny.en" => ("openai/whisper-tiny.en", "main"),
-            "base" => ("openai/whisper-base", "main"),
-            "base.en" => ("openai/whisper-base.en", "main"),
-            "small" => ("openai/whisper-small", "main"),
-            "small.en" => ("openai/whisper-small.en", "main"),
-            "medium" => ("openai/whisper-medium", "main"),
-            "medium.en" => ("openai/whisper-medium.en", "main"),
-            "large" => ("openai/whisper-large", "main"),
-            "large-v2" => ("openai/whisper-large-v2", "main"),
-            "large-v3" => ("openai/whisper-large-v3", "main"),
-            "large-v3-turbo" => ("openai/whisper-large-v3-turbo", "main"),
-            "distil-medium.en" => ("distil-whisper/distil-medium.en", "main"),
-            "distil-large-v3" => ("distil-whisper/distil-large-v3", "main"),
-            "distil-large-v3.5" => ("distil-whisper/distil-large-v3.5", "main"),
-            "parakeet-tdt-0.6b-v3" => ("nvidia/parakeet-tdt-0.6b-v3", "main"),
-            _ => ("openai/whisper-large-v3-turbo", "main"), // Default fallback
+            "tiny" => ("openai/whisper-tiny", "main", "model.safetensors"),
+            "tiny.en" => ("openai/whisper-tiny.en", "main", "model.safetensors"),
+            "base" => ("openai/whisper-base", "main", "model.safetensors"),
+            "base.en" => ("openai/whisper-base.en", "main", "model.safetensors"),
+            "small" => ("openai/whisper-small", "main", "model.safetensors"),
+            "small.en" => ("openai/whisper-small.en", "main", "model.safetensors"),
+            "medium" => ("openai/whisper-medium", "main", "model.safetensors"),
+            "medium.en" => ("openai/whisper-medium.en", "main", "model.safetensors"),
+            "large" => ("openai/whisper-large", "main", "model.safetensors"),
+            "large-v2" => ("openai/whisper-large-v2", "main", "model.safetensors"),
+            "large-v3" => ("openai/whisper-large-v3", "main", "model.safetensors"),
+            "large-v3-turbo" => ("openai/whisper-large-v3-turbo", "main", "model.safetensors"),
+            "large-v3-turbo-q41-gguf" => ("xkeyC/whisper-large-v3-turbo-gguf", "main", "model_q4_1.gguf"),
+            "large-v3-turbo-q4k-gguf" => ("xkeyC/whisper-large-v3-turbo-gguf", "main", "model_q4_k.gguf"),
+            "distil-small.en" => ("distil-whisper/distil-small.en", "main", "model.safetensors"),
+            "distil-medium.en" => ("distil-whisper/distil-medium.en", "main", "model.safetensors"),
+            "distil-large-v3" => ("distil-whisper/distil-large-v3", "main", "model.safetensors"),
+            "distil-large-v3.5" => ("distil-whisper/distil-large-v3.5", "main", "model.safetensors"),
+            _ => ("openai/whisper-large-v3-turbo", "main", "model.safetensors"), // Default fallback
         }
     }
 
@@ -143,9 +159,12 @@ impl WhisperTransformer {
             &self.device,
         )?;
 
-        // Run encoder with flush=true to reset internal state
+        // Run encoder based on model type
         debug!("Running encoder forward pass");
-        let audio_features = self.model.encoder.forward(&mel, true)?;
+        let audio_features = match &mut self.model {
+            WhisperModel::Normal(model) => model.encoder.forward(&mel, true)?,
+            WhisperModel::Quantized(model) => model.encoder.forward(&mel, true)?,
+        };
 
         // Enhanced decoding with repetition prevention
         debug!("Decoding audio features to text");
@@ -175,10 +194,22 @@ impl WhisperTransformer {
             
             // Use flush=false after first iteration to maintain decoder state
             let flush = i == 0;
-            let ys = self.model.decoder.forward(&tokens_t, &audio_features, flush)?;
+            let ys = match &mut self.model {
+                WhisperModel::Normal(model) => model.decoder.forward(&tokens_t, &audio_features, flush)?,
+                WhisperModel::Quantized(model) => model.decoder.forward(&tokens_t, &audio_features, flush)?,
+            };
+            
             let (_, seq_len, _) = ys.dims3()?;
-            let logits = self.model.decoder.final_linear(&ys.i((..1, seq_len - 1..))?)?
-                .i(0)?.i(0)?;
+            let logits = match &mut self.model {
+                WhisperModel::Normal(model) => {
+                    model.decoder.final_linear(&ys.i((..1, seq_len - 1..))?)?
+                        .i(0)?.i(0)?
+                },
+                WhisperModel::Quantized(model) => {
+                    model.decoder.final_linear(&ys.i((..1, seq_len - 1..))?)?
+                        .i(0)?.i(0)?
+                },
+            };
             
             // Apply repetition penalty
             let mut logits_v: Vec<f32> = logits.to_vec1()?;
@@ -264,8 +295,9 @@ mod tests {
 
     #[test]
     fn test_model_info() {
-        let (model_id, revision) = WhisperTransformer::get_model_info("tiny.en");
+        let (model_id, revision, model_file) = WhisperTransformer::get_model_info("tiny.en");
         assert_eq!(model_id, "openai/whisper-tiny.en");
         assert_eq!(revision, "main");
+        assert_eq!(model_file, "model.safetensors");
     }
 }
