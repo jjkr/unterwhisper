@@ -561,7 +561,15 @@ impl RealtimeTranscriber {
             let _ = handle.join();
         }
 
-        info!("Transcription pipeline stopped");
+        // Recreate channels for next start
+        let (pcm_tx, pcm_rx) = unbounded();
+        self.pcm_tx = Some(pcm_tx);
+        self.pcm_rx = Some(pcm_rx);
+
+        // Clear mel buffer for next session
+        self.mel_buffer.lock().unwrap().clear();
+
+        info!("Transcription pipeline stopped and reset for next session");
     }
 }
 
