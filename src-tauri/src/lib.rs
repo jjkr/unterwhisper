@@ -666,6 +666,15 @@ pub fn run() {
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .level(log::LevelFilter::Debug)  // Always use Debug level
+                    .format(|out, message, record| {
+                        out.finish(format_args!(
+                            "[{} {} {}] {}",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                            record.level(),
+                            record.target(),
+                            message
+                        ))
+                    })
                     .target(tauri_plugin_log::Target::new(
                         tauri_plugin_log::TargetKind::LogDir { file_name: Some("app".to_string()) }
                     ))
