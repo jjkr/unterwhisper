@@ -1,5 +1,5 @@
 use global_hotkey::{GlobalHotKeyManager, GlobalHotKeyEvent, hotkey::{Code, HotKey, Modifiers}, HotKeyState};
-use log::{info, error, warn};
+use log::{debug, info, error, warn};
 use tauri::{Manager, Emitter};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +13,89 @@ mod asr;
 
 pub use settings::Settings;
 use asr::RealtimeTranscriber;
+
+/// Check if accessibility permissions are granted on macOS
+#[cfg(target_os = "macos")]
+fn check_accessibility_permission() -> bool {
+    use std::process::Command;
+    
+    debug!("Checking accessibility permissions...");
+    
+    // Check if accessibility permissions are granted
+    // This uses AppleScript to check the permission status
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to get name of every process")
+        .output();
+    
+    // If the command succeeds, we likely have accessibility permissions
+    // If it fails, we definitely don't have them
+    let result = match output {
+        Ok(result) => {
+            let has_permission = result.status.success();
+            debug!("Accessibility permission check result: {}", has_permission);
+            has_permission
+        },
+        Err(e) => {
+            debug!("Accessibility permission check failed: {}", e);
+            false
+        }
+    };
+    
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_accessibility_permission() -> bool {
+    true
+}
+
+/// Check if microphone permissions are granted on macOS
+#[cfg(target_os = "macos")]
+fn check_microphone_permission() -> bool {
+    use std::process::Command;
+    
+    debug!("Checking microphone permissions...");
+    
+    // Use osascript to check microphone permission status
+    // This is a workaround since Rust doesn't have direct AVFoundation bindings
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg("tell application \"System Events\" to return true")
+        .output();
+    
+    // If we can run osascript, we assume permissions are OK for now
+    // A more robust check would require Objective-C bindings
+    let result = output.is_ok();
+    debug!("Microphone permission check result: {}", result);
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn check_microphone_permission() -> bool {
+    // On non-macOS platforms, assume permission is granted
+    true
+}
+
+/// Display a notification to the user
+fn show_notification(app: &tauri::AppHandle, title: &str, body: &str) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    
+    debug!("Showing notification - Title: '{}', Body: '{}'", title, body);
+    
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| {
+            error!("Failed to show notification: {}", e);
+            format!("Failed to show notification: {}", e)
+        })?;
+    
+    debug!("Notification shown successfully");
+    Ok(())
+}
 
 /// Application state shared across Tauri commands and event handlers
 pub struct AppState {
@@ -105,7 +188,7 @@ fn spawn_transcription_polling_thread(
 }
 
 /// Stop recording and return final transcription text
-fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, String> {
+fn stop_recording(state: &AppState, app: &tauri::AppHandle) -> Result<String, String> {
     info!("Stopping recording");
     
     // Check if actually recording
@@ -142,6 +225,11 @@ fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, S
     // Set recording flag to false
     state.is_recording.store(false, Ordering::SeqCst);
     
+    // Check if no speech was detected
+    if final_text.trim().is_empty() {
+        warn!("No speech detected in recording");
+    }
+    
     info!("Recording stopped, final text: {}", final_text);
     Ok(final_text)
 }
@@ -149,14 +237,23 @@ fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, S
 /// Show a window by label
 fn show_window(app: &tauri::AppHandle, label: &str) -> Result<(), String> {
     info!("Showing window: {}", label);
+    debug!("Attempting to get window with label: '{}'", label);
     
     // Get window by label
     let window = app.get_webview_window(label)
-        .ok_or_else(|| format!("Window not found: {}", label))?;
+        .ok_or_else(|| {
+            error!("Window not found: {}", label);
+            format!("Window not found: {}", label)
+        })?;
+    
+    debug!("Window '{}' found, calling show()", label);
     
     // Show the window
     window.show()
-        .map_err(|e| format!("Failed to show window {}: {}", label, e))?;
+        .map_err(|e| {
+            error!("Failed to show window {}: {}", label, e);
+            format!("Failed to show window {}: {}", label, e)
+        })?;
     
     info!("Window {} shown successfully", label);
     Ok(())
@@ -165,21 +262,30 @@ fn show_window(app: &tauri::AppHandle, label: &str) -> Result<(), String> {
 /// Hide a window by label
 fn hide_window(app: &tauri::AppHandle, label: &str) -> Result<(), String> {
     info!("Hiding window: {}", label);
+    debug!("Attempting to get window with label: '{}'", label);
     
     // Get window by label
     let window = app.get_webview_window(label)
-        .ok_or_else(|| format!("Window not found: {}", label))?;
+        .ok_or_else(|| {
+            error!("Window not found: {}", label);
+            format!("Window not found: {}", label)
+        })?;
+    
+    debug!("Window '{}' found, calling hide()", label);
     
     // Hide the window
     window.hide()
-        .map_err(|e| format!("Failed to hide window {}: {}", label, e))?;
+        .map_err(|e| {
+            error!("Failed to hide window {}: {}", label, e);
+            format!("Failed to hide window {}: {}", label, e)
+        })?;
     
     info!("Window {} hidden successfully", label);
     Ok(())
 }
 
 /// Copy text to clipboard and simulate Cmd+V paste
-fn copy_and_paste(text: &str) -> Result<(), String> {
+fn copy_and_paste(text: &str, app: &tauri::AppHandle) -> Result<(), String> {
     info!("Copying and pasting text: {}", text);
     
     // Handle empty text
@@ -190,10 +296,16 @@ fn copy_and_paste(text: &str) -> Result<(), String> {
     
     // Copy text to clipboard
     let mut clipboard = Clipboard::new()
-        .map_err(|e| format!("Failed to access clipboard: {}", e))?;
+        .map_err(|e| {
+            error!("Failed to access clipboard: {}", e);
+            format!("Failed to access clipboard: {}", e)
+        })?;
     
     clipboard.set_text(text)
-        .map_err(|e| format!("Failed to copy text to clipboard: {}", e))?;
+        .map_err(|e| {
+            error!("Failed to copy text to clipboard: {}", e);
+            format!("Failed to copy text to clipboard: {}", e)
+        })?;
     
     info!("Text copied to clipboard successfully");
     
@@ -202,15 +314,27 @@ fn copy_and_paste(text: &str) -> Result<(), String> {
     
     // Simulate Cmd+V keypress
     let mut enigo = Enigo::new(&EnigoSettings::default())
-        .map_err(|e| format!("Failed to create keyboard controller: {}", e))?;
+        .map_err(|e| {
+            error!("Failed to create keyboard controller: {}", e);
+            format!("Failed to create keyboard controller: {}", e)
+        })?;
     
     // Press Cmd+V (Meta key is Cmd on macOS)
     enigo.key(Key::Meta, enigo::Direction::Press)
-        .map_err(|e| format!("Failed to press Cmd key: {}", e))?;
+        .map_err(|e| {
+            error!("Failed to press Cmd key: {}", e);
+            format!("Failed to press Cmd key: {}", e)
+        })?;
     enigo.key(Key::Unicode('v'), enigo::Direction::Click)
-        .map_err(|e| format!("Failed to press V key: {}", e))?;
+        .map_err(|e| {
+            error!("Failed to press V key: {}", e);
+            format!("Failed to press V key: {}", e)
+        })?;
     enigo.key(Key::Meta, enigo::Direction::Release)
-        .map_err(|e| format!("Failed to release Cmd key: {}", e))?;
+        .map_err(|e| {
+            error!("Failed to release Cmd key: {}", e);
+            format!("Failed to release Cmd key: {}", e)
+        })?;
     
     info!("Paste command simulated successfully");
     
@@ -220,61 +344,117 @@ fn copy_and_paste(text: &str) -> Result<(), String> {
 /// Start recording and transcription
 fn start_recording(state: &AppState, app: &tauri::AppHandle) -> Result<(), String> {
     info!("Starting recording");
-    
+    debug!("=== START RECORDING CALLED ===");
+
     // Check if already recording
-    if state.is_recording.load(Ordering::SeqCst) {
+    let is_recording = state.is_recording.load(Ordering::SeqCst);
+    debug!("Current recording state: {}", is_recording);
+    
+    if is_recording {
         warn!("Already recording, ignoring start request");
         return Err("Already recording".to_string());
     }
-    
+
+    // Check microphone permissions
+    debug!("Checking microphone permissions...");
+    if !check_microphone_permission() {
+        error!("Microphone permission denied - please grant microphone access in System Settings > Privacy & Security > Microphone");
+        return Err("Microphone permission denied".to_string());
+    }
+    debug!("Microphone permissions OK");
+
     // Get settings
+    debug!("Acquiring settings lock...");
     let settings = state.settings.lock()
-        .map_err(|e| format!("Failed to lock settings: {}", e))?
+        .map_err(|e| {
+            error!("Failed to lock settings: {}", e);
+            format!("Failed to lock settings: {}", e)
+        })?
         .clone();
-    
+    debug!("Settings acquired: model={}, language={:?}", settings.model, settings.language);
+
     // Create transcriber config
+    debug!("Creating transcriber config...");
     let config = asr::TranscriberConfig {
         model_name: settings.model.clone(),
         language: settings.language.clone(),
         ..Default::default()
     };
-    
+    debug!("Transcriber config created");
+
     // Create transcriber
+    debug!("Creating RealtimeTranscriber...");
     let mut transcriber = RealtimeTranscriber::new(config, candle_core::Device::Cpu)
-        .map_err(|e| format!("Failed to create transcriber: {}", e))?;
-    
+        .map_err(|e| {
+            error!("Failed to create transcriber: {}", e);
+            format!("Failed to create transcriber: {}", e)
+        })?;
+    debug!("RealtimeTranscriber created successfully");
+
     // Start transcriber
+    debug!("Starting transcriber...");
     transcriber.start()
-        .map_err(|e| format!("Failed to start transcriber: {}", e))?;
-    
+        .map_err(|e| {
+            error!("Failed to start transcriber: {}", e);
+            format!("Failed to start transcriber: {}", e)
+        })?;
+    debug!("Transcriber started successfully");
+
     // Store transcriber in state
+    debug!("Storing transcriber in state...");
     *state.transcriber.lock()
-        .map_err(|e| format!("Failed to lock transcriber: {}", e))? = Some(transcriber);
-    
+        .map_err(|e| {
+            error!("Failed to lock transcriber: {}", e);
+            format!("Failed to lock transcriber: {}", e)
+        })? = Some(transcriber);
+    debug!("Transcriber stored in state");
+
     // Set recording flag
+    debug!("Setting recording flag to true...");
     state.is_recording.store(true, Ordering::SeqCst);
+    debug!("Recording flag set to true");
+
+    // Show the transcription window directly
+    debug!("Showing transcription window...");
+    show_window(app, "transcription")
+        .map_err(|e| {
+            error!("Failed to show transcription window: {}", e);
+            format!("Failed to show transcription window: {}", e)
+        })?;
+    debug!("Transcription window shown");
     
-    // Emit show-window event to frontend
-    app.emit("show-window", ())
-        .map_err(|e| format!("Failed to emit show-window event: {}", e))?;
+    // Also emit event for frontend to update state
+    debug!("Emitting show-window event...");
+    let _ = app.emit("show-window", ());
+    debug!("Event emitted");
     
     // Spawn transcription polling thread
+    debug!("Spawning transcription polling thread...");
     spawn_transcription_polling_thread(state, app.clone());
+    debug!("Transcription polling thread spawned");
     
     info!("Recording started successfully");
+    debug!("=== START RECORDING COMPLETED ===");
     Ok(())
 }
 
 /// Handle the "Start Recording" menu item
 fn handle_start_recording(app: &tauri::AppHandle) {
     info!("Start Recording triggered from menu");
-    
+    debug!("=== TRAY MENU: START RECORDING CLICKED ===");
+
     // Get the app state
+    debug!("Getting app state...");
     let state = app.state::<AppState>();
-    
+    debug!("App state acquired");
+
     // Start recording
+    debug!("Calling start_recording...");
     if let Err(e) = start_recording(&state, app) {
-        error!("Failed to start recording: {}", e);
+        error!("Failed to start recording from menu: {}", e);
+        debug!("=== TRAY MENU: START RECORDING FAILED ===");
+    } else {
+        debug!("=== TRAY MENU: START RECORDING SUCCESS ===");
     }
 }
 
@@ -319,17 +499,20 @@ fn handle_hotkey_event(app: &tauri::AppHandle, event: GlobalHotKeyEvent) {
                     info!("Recording stopped with text: {}", text);
                     
                     // Copy and paste the transcription
-                    if let Err(e) = copy_and_paste(&text) {
+                    if let Err(e) = copy_and_paste(&text, app) {
                         error!("Failed to copy and paste: {}", e);
                     }
                     
                     // Wait 1 second before hiding window
                     thread::sleep(Duration::from_secs(1));
                     
-                    // Emit hide-window event
-                    if let Err(e) = app.emit("hide-window", ()) {
-                        error!("Failed to emit hide-window event: {}", e);
+                    // Hide the transcription window directly
+                    if let Err(e) = hide_window(app, "transcription") {
+                        error!("Failed to hide transcription window: {}", e);
                     }
+                    
+                    // Also emit event for frontend
+                    let _ = app.emit("hide-window", ());
                 }
                 Err(e) => {
                     error!("Failed to stop recording: {}", e);
@@ -412,19 +595,33 @@ fn manual_stop_recording(state: tauri::State<AppState>, app: tauri::AppHandle) -
 }
 
 pub fn run() {
-    info!("🦉🦉🦉🦉🦉🦉🦉🦉 UNTER WHISPER STARTING 🦉🦉🦉🦉🦉🦉🦉🦉");
+    eprintln!("🦉🦉🦉🦉🦉🦉🦉🦉 UNTER WHISPER STARTING 🦉🦉🦉🦉🦉🦉🦉🦉");
+    eprintln!("Debug logging enabled");
+    
+    // Print log file location
+    let log_dir = dirs::data_local_dir()
+        .map(|p| p.join("unterwhisper").join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+    eprintln!("Log file location: {:?}/app.log", log_dir);
+    eprintln!("You can tail the logs with: tail -f {:?}/app.log", log_dir);
 
     // Load settings from config file
+    eprintln!("Loading settings...");
     let settings = Settings::load().unwrap_or_else(|e| {
-        log::warn!("Failed to load settings: {}. Using defaults.", e);
+        eprintln!("Failed to load settings: {}. Using defaults.", e);
         Settings::default()
     });
+    eprintln!("Settings loaded: model={}, language={:?}", settings.model, settings.language);
     
     // Initialize application state
+    eprintln!("Initializing application state...");
     let app_state = AppState::with_settings(settings);
+    eprintln!("Application state initialized");
 
+    eprintln!("Building Tauri application...");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             greet,
@@ -434,20 +631,39 @@ pub fn run() {
             manual_stop_recording
         ])
         .setup(move |app| {
-            // Set up logging
+            // Set up logging with file output
+            let log_dir = dirs::data_local_dir()
+                .map(|p| p.join("unterwhisper").join("logs"))
+                .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+            
+            // Create log directory if it doesn't exist
+            if let Err(e) = std::fs::create_dir_all(&log_dir) {
+                eprintln!("Failed to create log directory: {}", e);
+            }
+            
+            let log_file = log_dir.join("app.log");
+            
+            eprintln!("=== UNTERWHISPER SETUP STARTING ===");
+            eprintln!("Logging to file: {:?}", log_file);
+            
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
-                    .level(if cfg!(debug_assertions) {
-                        log::LevelFilter::Debug
-                    } else {
-                        log::LevelFilter::Info
-                    })
+                    .level(log::LevelFilter::Debug)  // Always use Debug level
+                    .target(tauri_plugin_log::Target::new(
+                        tauri_plugin_log::TargetKind::LogDir { file_name: Some("app".to_string()) }
+                    ))
                     .build(),
             )?;
 
+            info!("=== UNTERWHISPER SETUP: Logging initialized ===");
+            debug!("Log directory: {:?}", log_dir);
+            debug!("Log file: {:?}", log_file);
+            
             info!("Setting up system tray...");
+            debug!("Creating tray menu...");
             
             // Create system tray menu
+            debug!("Building menu items...");
             let menu = tauri::menu::MenuBuilder::new(app)
                 .item(
                     &tauri::menu::MenuItemBuilder::with_id("start_recording", "Start Recording")
@@ -459,19 +675,27 @@ pub fn run() {
                         .build(app)?,
                 )
                 .build()?;
+            
+            debug!("Menu built successfully");
+            debug!("Creating tray icon...");
 
             // Create system tray
             let _tray = tauri::tray::TrayIconBuilder::new()
                 .menu(&menu)
                 .on_menu_event(|app, event| {
+                    debug!("Tray menu event received: {:?}", event.id());
                     match event.id().as_ref() {
                         "start_recording" => {
+                            debug!("Tray menu: 'start_recording' selected");
                             handle_start_recording(app);
                         }
                         "quit" => {
+                            debug!("Tray menu: 'quit' selected");
                             handle_quit(app);
                         }
-                        _ => {}
+                        _ => {
+                            debug!("Tray menu: unknown event {:?}", event.id());
+                        }
                     }
                 })
                 .build(app)?;
@@ -481,14 +705,15 @@ pub fn run() {
             // Register global hotkey (Cmd+Shift+Space)
             info!("Registering global hotkey (Cmd+Shift+Space)...");
             
+            // Check accessibility permissions first
+            if !check_accessibility_permission() {
+                warn!("Accessibility permissions not granted - please grant Accessibility permission in System Settings > Privacy & Security > Accessibility to enable global hotkeys. You can still use the tray menu to start recording.");
+            }
+            
             let hotkey_manager = match GlobalHotKeyManager::new() {
                 Ok(manager) => manager,
                 Err(e) => {
-                    error!("Failed to create hotkey manager: {}", e);
-                    
-                    // Log error for user to see
-                    error!("Hotkey Registration Failed: Failed to initialize hotkey system: {}. The app will continue without hotkey support.", e);
-                    
+                    error!("Failed to create hotkey manager: {} - please check that Accessibility permissions are granted in System Settings. You can still use the tray menu to start recording.", e);
                     warn!("Continuing without hotkey support");
                     return Ok(());
                 }
@@ -497,11 +722,7 @@ pub fn run() {
             let hotkey = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
             
             if let Err(e) = hotkey_manager.register(hotkey) {
-                error!("Failed to register hotkey: {}", e);
-                
-                // Log error for user to see
-                error!("Hotkey Registration Failed: Failed to register Cmd+Shift+Space hotkey: {}. The hotkey may be in use by another application. You can still use the tray menu to start recording.", e);
-                
+                error!("Failed to register hotkey: {} - the hotkey may be in use by another application, or Accessibility permissions may not be granted. You can still use the tray menu to start recording.", e);
                 warn!("Continuing without hotkey support");
                 return Ok(());
             }
@@ -511,6 +732,7 @@ pub fn run() {
             // Spawn background thread to poll for hotkey events
             spawn_hotkey_polling_thread(app.handle().clone());
             
+            info!("Unterwhisper started - press Cmd+Shift+Space to start recording, or use the tray menu");
             info!("Tauri setup completed successfully");
 
             Ok(())

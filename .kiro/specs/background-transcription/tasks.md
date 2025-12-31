@@ -151,18 +151,18 @@ This plan implements a minimal viable product (MVP) for a background transcripti
     - Update component state accordingly
     - _Requirements: 3.2, 3.3_
 
-- [ ] 10. Implement error handling and notifications
-  - [ ] 10.1 Add microphone permission check
+- [x] 10. Implement error handling and notifications
+  - [x] 10.1 Add microphone permission check
     - Check permissions before starting recording
     - Display notification if permissions denied
     - _Requirements: 4.5, 9.1_
 
-  - [ ] 10.2 Add error logging
+  - [x] 10.2 Add error logging
     - Set up log file in Application Support directory
     - Log errors with context
     - _Requirements: 9.5_
 
-  - [ ] 10.3 Add error notifications for common failures
+  - [x] 10.3 Add error notifications for common failures
     - Whisper model load failures
     - Recording failures
     - No speech detected
