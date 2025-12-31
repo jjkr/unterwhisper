@@ -1,17 +1,34 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import TranscriptionWindow from "./TranscriptionWindow";
 import "./App.css";
 
 function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
+  const [windowLabel, setWindowLabel] = useState("");
+
+  useEffect(() => {
+    const getLabel = async () => {
+      const window = getCurrentWindow();
+      setWindowLabel(window.label);
+    };
+    getLabel();
+  }, []);
 
   async function greet() {
     // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
     setGreetMsg(await invoke("greet", { name }));
   }
 
+  // Render transcription window if this is the transcription window
+  if (windowLabel === "transcription") {
+    return <TranscriptionWindow />;
+  }
+
+  // Otherwise render the main app
   return (
     <main className="container">
       <h1>Welcome to Tauri + React</h1>

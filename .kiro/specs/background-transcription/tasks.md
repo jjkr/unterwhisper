@@ -52,34 +52,34 @@ This plan implements a minimal viable product (MVP) for a background transcripti
     - Handle "Quit" menu item
     - _Requirements: 1.3, 1.4, 10.4_
 
-- [ ] 4. Implement hotkey handling
-  - [ ] 4.1 Create hotkey event polling loop
+- [x] 4. Implement hotkey handling
+  - [x] 4.1 Create hotkey event polling loop
     - Spawn background thread to poll hotkey events
     - Handle press event (start recording)
     - Handle release event (stop recording)
     - _Requirements: 2.2, 2.3, 2.5_
 
-  - [ ] 4.2 Implement hotkey error handling
+  - [x] 4.2 Implement hotkey error handling
     - Handle registration failures gracefully
     - Display error notifications if hotkey conflicts
     - _Requirements: 2.4, 9.2_
 
-- [ ] 5. Implement recording control functions
-  - [ ] 5.1 Implement start_recording function
+- [x] 5. Implement recording control functions
+  - [x] 5.1 Implement start_recording function
     - Create RealtimeTranscriber with settings
     - Start transcriber
     - Set is_recording flag to true
     - Emit "show-window" event to frontend
     - _Requirements: 3.1, 4.1, 4.2_
 
-  - [ ] 5.2 Implement stop_recording function
+  - [x] 5.2 Implement stop_recording function
     - Stop transcriber
     - Get final transcription text
     - Set is_recording flag to false
     - Return transcription text
     - _Requirements: 4.4_
 
-  - [ ] 5.3 Implement transcription polling loop
+  - [x] 5.3 Implement transcription polling loop
     - Spawn background thread to poll transcription updates
     - Emit "transcription-update" events to frontend
     - Continue until recording stops
@@ -93,14 +93,14 @@ This plan implements a minimal viable product (MVP) for a background transcripti
     - **Property 3: Transcription Text Accumulation**
     - **Validates: Requirements 3.2, 3.3**
 
-- [ ] 6. Implement clipboard and paste functionality
-  - [ ] 6.1 Implement copy_and_paste function
+- [x] 6. Implement clipboard and paste functionality
+  - [x] 6.1 Implement copy_and_paste function
     - Copy transcription text to clipboard
     - Simulate Cmd+V keypress using enigo
     - Handle clipboard errors gracefully
     - _Requirements: 5.1, 5.2, 5.5_
 
-  - [ ] 6.2 Integrate paste into stop_recording flow
+  - [x] 6.2 Integrate paste into stop_recording flow
     - Call copy_and_paste after getting final transcription
     - Emit "hide-window" event after paste
     - Add 1 second delay before hiding window
@@ -111,8 +111,8 @@ This plan implements a minimal viable product (MVP) for a background transcripti
     - Test error handling for clipboard failures
     - _Requirements: 5.4_
 
-- [ ] 7. Implement window control functions
-  - [ ] 7.1 Implement show_window and hide_window functions
+- [x] 7. Implement window control functions
+  - [x] 7.1 Implement show_window and hide_window functions
     - Get window by label
     - Call show() or hide() on window
     - Handle window not found errors
@@ -122,29 +122,29 @@ This plan implements a minimal viable product (MVP) for a background transcripti
     - Test show/hide operations
     - Test error handling for missing windows
 
-- [ ] 8. Implement Tauri commands
-  - [ ] 8.1 Implement get_settings command
+- [x] 8. Implement Tauri commands
+  - [x] 8.1 Implement get_settings command
     - Return current settings from AppState
     - _Requirements: 6.6_
 
-  - [ ] 8.2 Implement update_settings command
+  - [x] 8.2 Implement update_settings command
     - Update settings in AppState
     - Save settings to config file
     - _Requirements: 6.5_
 
-  - [ ] 8.3 Implement manual recording control commands
+  - [x] 8.3 Implement manual recording control commands
     - Implement manual_start_recording command
     - Implement manual_stop_recording command
     - _Requirements: 1.3_
 
-- [ ] 9. Implement React transcription window
-  - [ ] 9.1 Create TranscriptionWindow component
+- [x] 9. Implement React transcription window
+  - [x] 9.1 Create TranscriptionWindow component
     - Display transcription text with proper styling
     - Semi-transparent background
     - Auto-sizing based on text length
     - _Requirements: 3.2, 3.6_
 
-  - [ ] 9.2 Set up event listeners
+  - [x] 9.2 Set up event listeners
     - Listen for "transcription-update" events
     - Listen for "show-window" events
     - Listen for "hide-window" events
