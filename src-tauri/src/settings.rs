@@ -12,7 +12,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model: "distil-large-v3.5".to_string(),
+            model: "tiny.en".to_string(),
             language: None,
         }
     }

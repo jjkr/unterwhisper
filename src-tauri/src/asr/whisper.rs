@@ -66,7 +66,7 @@ impl WhisperTransformer {
             "large-v2" => ("openai/whisper-large-v2", "main"),
             "large-v3" => ("openai/whisper-large-v3", "main"),
             "large-v3-turbo" => ("openai/whisper-large-v3-turbo", "main"),
-            "distil-medium" => ("distil-whisper/distil-medium", "main"),
+            "distil-medium.en" => ("distil-whisper/distil-medium.en", "main"),
             "distil-large-v3" => ("distil-whisper/distil-large-v3", "main"),
             "distil-large-v3.5" => ("distil-whisper/distil-large-v3.5", "main"),
             "parakeet-tdt-0.6b-v3" => ("nvidia/parakeet-tdt-0.6b-v3", "main"),

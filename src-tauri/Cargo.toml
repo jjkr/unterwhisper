@@ -14,6 +14,12 @@ edition = "2021"
 name = "unterwhisper_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = ["metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -44,3 +50,6 @@ rand = "0.8"
 realfft = "3.3"
 tracing = "0.1"
 tokenizers = "0.20"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-sys = "0.1"
