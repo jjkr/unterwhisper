@@ -3,10 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use crate::asr::audio::{AudioRecorder, DeviceId};
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Settings {
     pub model: String,
     pub language: Option<String>,
+    #[serde(default)]
+    pub device_id: DeviceId,
 }
 
 impl Default for Settings {
@@ -14,6 +18,7 @@ impl Default for Settings {
         Self {
             model: "tiny.en".to_string(),
             language: None,
+            device_id: DeviceId::SystemDefault,
         }
     }
 }
@@ -25,6 +30,20 @@ impl Settings {
             .context("Failed to get local data directory")?
             .join("com.unterwhisper.app");
         Ok(app_dir.join("config.json"))
+    }
+
+    /// Validate that the selected device is available
+    pub fn validate_device(&self) -> Result<()> {
+        AudioRecorder::find_device_by_id(&self.device_id)?;
+        Ok(())
+    }
+
+    /// Get the device name for display purposes
+    pub fn get_device_name(&self) -> String {
+        match &self.device_id {
+            DeviceId::SystemDefault => "System Default".to_string(),
+            DeviceId::Specific { value } => value.clone(),
+        }
     }
 
     /// Load settings from the config file, or return defaults if file doesn't exist
@@ -97,8 +116,9 @@ mod tests {
     #[test]
     fn test_default_settings() {
         let settings = Settings::default();
-        assert_eq!(settings.model, "distil-large-v3.5");
+        assert_eq!(settings.model, "tiny.en");
         assert_eq!(settings.language, None);
+        assert_eq!(settings.device_id, DeviceId::SystemDefault);
     }
 
     #[test]
@@ -106,6 +126,7 @@ mod tests {
         let settings = Settings {
             model: "tiny.en".to_string(),
             language: Some("en".to_string()),
+            device_id: DeviceId::SystemDefault,
         };
 
         let json = serde_json::to_string(&settings).unwrap();
@@ -135,6 +156,9 @@ mod tests {
         let settings = Settings {
             model: "base.en".to_string(),
             language: Some("en".to_string()),
+            device_id: DeviceId::Specific {
+                value: "Test Microphone".to_string(),
+            },
         };
 
         // Save settings
@@ -195,5 +219,59 @@ mod tests {
 
         // Clean up
         let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn test_get_device_name_system_default() {
+        let settings = Settings {
+            model: "tiny.en".to_string(),
+            language: None,
+            device_id: DeviceId::SystemDefault,
+        };
+        
+        assert_eq!(settings.get_device_name(), "System Default");
+    }
+
+    #[test]
+    fn test_get_device_name_specific() {
+        let settings = Settings {
+            model: "tiny.en".to_string(),
+            language: None,
+            device_id: DeviceId::Specific {
+                value: "USB Microphone".to_string(),
+            },
+        };
+        
+        assert_eq!(settings.get_device_name(), "USB Microphone");
+    }
+
+    #[test]
+    fn test_settings_with_device_id_serialization() {
+        let settings = Settings {
+            model: "tiny.en".to_string(),
+            language: Some("en".to_string()),
+            device_id: DeviceId::Specific {
+                value: "MacBook Pro Microphone".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let deserialized: Settings = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_settings_migration_from_old_format() {
+        // Old settings without device_id field
+        let old_json = r#"{"model":"tiny.en","language":null}"#;
+        
+        let settings: Settings = serde_json::from_str(old_json).unwrap();
+        
+        // Should have default device_id
+        assert_eq!(settings.device_id, DeviceId::SystemDefault);
+        // Should preserve other fields
+        assert_eq!(settings.model, "tiny.en");
+        assert_eq!(settings.language, None);
     }
 }

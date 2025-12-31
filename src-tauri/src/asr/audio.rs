@@ -3,9 +3,37 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::Sender;
 use ringbuf::traits::Producer;
 use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 
 pub const SAMPLE_RATE: u32 = 16000;
 pub const CHANNELS: u16 = 1;
+
+/// Device identifier that can be serialized and persisted
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "type")]
+pub enum DeviceId {
+    /// Use the system default input device
+    SystemDefault,
+    /// Use a specific device by its name
+    Specific { value: String },
+}
+
+impl Default for DeviceId {
+    fn default() -> Self {
+        DeviceId::SystemDefault
+    }
+}
+
+/// Information about an audio input device
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AudioDeviceInfo {
+    /// Unique identifier for the device (using device name)
+    pub id: String,
+    /// Human-readable device name
+    pub name: String,
+    /// Whether this is the system default device
+    pub is_default: bool,
+}
 
 /// Audio chunk containing raw PCM samples
 #[derive(Debug, Clone)]
@@ -72,6 +100,57 @@ impl AudioRecorder {
         }
 
         anyhow::bail!("No device found matching '{}'", name)
+    }
+
+    /// Get the system default input device
+    pub fn get_default_device() -> Result<cpal::Device> {
+        let host = cpal::default_host();
+        host.default_input_device()
+            .context("No default input device available")
+    }
+
+    /// List all available input devices with metadata
+    pub fn list_input_devices_with_info() -> Result<Vec<AudioDeviceInfo>> {
+        let host = cpal::default_host();
+        let default_device = host.default_input_device();
+        let default_name = default_device
+            .as_ref()
+            .and_then(|d| d.description().ok())
+            .map(|desc| desc.name().to_string());
+        
+        let mut devices = Vec::new();
+        
+        for device in host.input_devices()? {
+            if let Ok(desc) = device.description() {
+                let name = desc.name().to_string();
+                let is_default = Some(&name) == default_name.as_ref();
+                
+                devices.push(AudioDeviceInfo {
+                    id: name.clone(), // Use name as ID for simplicity
+                    name,
+                    is_default,
+                });
+            }
+        }
+        
+        Ok(devices)
+    }
+
+    /// Find a device by its identifier
+    pub fn find_device_by_id(device_id: &DeviceId) -> Result<cpal::Device> {
+        match device_id {
+            DeviceId::SystemDefault => Self::get_default_device(),
+            DeviceId::Specific { value } => {
+                // Use existing find_device_by_name since we use name as ID
+                Self::find_device_by_name(value)
+            }
+        }
+    }
+
+    /// Create a recorder with device from settings
+    pub fn from_device_id(device_id: &DeviceId) -> Result<Self> {
+        let device = Self::find_device_by_id(device_id)?;
+        Ok(Self::with_device(device))
     }
 
     /// Start streaming audio samples to the provided ringbuf producer

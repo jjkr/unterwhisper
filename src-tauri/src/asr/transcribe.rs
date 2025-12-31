@@ -246,6 +246,17 @@ impl RealtimeTranscriber {
         info!("Transcription pipeline started successfully");
         Ok(())
     }
+    
+    /// Start the transcription pipeline with a custom audio recorder
+    pub fn start_with_recorder(&mut self, recorder: AudioRecorder) -> Result<()> {
+        info!("Starting transcription pipeline with custom recorder");
+        
+        // Replace the audio recorder
+        self.audio_recorder = recorder;
+        
+        // Use the standard start method
+        self.start()
+    }
 
     /// Process an audio chunk and generate mel spectrogram if enough samples are available
     fn process_audio_chunk(

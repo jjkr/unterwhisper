@@ -1,0 +1,366 @@
+/* Settings Dialog Overlay */
+.settings-dialog-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+/* Settings Dialog Container */
+.settings-dialog {
+  background-color: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  width: 90%;
+  max-width: 500px;
+  max-height: 90vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Dialog Header */
+.settings-dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px 24px;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.settings-dialog-header h2 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.close-button {
+  background: none;
+  border: none;
+  font-size: 2rem;
+  line-height: 1;
+  cursor: pointer;
+  color: #666;
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.close-button:hover {
+  background-color: #f0f0f0;
+  color: #333;
+}
+
+/* Dialog Content */
+.settings-dialog-content {
+  padding: 24px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+/* Settings Section */
+.settings-section {
+  margin-bottom: 24px;
+}
+
+.settings-section:last-of-type {
+  margin-bottom: 0;
+}
+
+.settings-section label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 500;
+  color: #333;
+}
+
+.settings-section select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  font-size: 1rem;
+  background-color: #ffffff;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.settings-section select:hover {
+  border-color: #999;
+}
+
+.settings-section select:focus {
+  outline: none;
+  border-color: #396cd8;
+  box-shadow: 0 0 0 3px rgba(57, 108, 216, 0.1);
+}
+
+.help-text {
+  margin-top: 6px;
+  font-size: 0.875rem;
+  color: #666;
+  line-height: 1.4;
+}
+
+/* Device Selector Styling */
+.device-selector {
+  margin-bottom: 0;
+}
+
+.device-selector label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 500;
+  color: #333;
+}
+
+.device-selector select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d0d0d0;
+  border-radius: 6px;
+  font-size: 1rem;
+  background-color: #ffffff;
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+
+.device-selector select:hover {
+  border-color: #999;
+}
+
+.device-selector select:focus {
+  outline: none;
+  border-color: #396cd8;
+  box-shadow: 0 0 0 3px rgba(57, 108, 216, 0.1);
+}
+
+.no-devices {
+  padding: 16px;
+  background-color: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: 6px;
+  color: #856404;
+}
+
+.no-devices p {
+  margin: 0 0 8px 0;
+}
+
+.no-devices p:last-of-type {
+  margin-bottom: 12px;
+}
+
+.no-devices button {
+  background-color: #ffc107;
+  color: #000;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.no-devices button:hover {
+  background-color: #e0a800;
+}
+
+/* Loading State */
+.loading {
+  text-align: center;
+  padding: 40px 20px;
+  color: #666;
+}
+
+/* Error State */
+.error {
+  text-align: center;
+  padding: 20px;
+}
+
+.error p {
+  color: #d32f2f;
+  margin-bottom: 16px;
+}
+
+.error button {
+  background-color: #d32f2f;
+  color: white;
+  border: none;
+  padding: 10px 20px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.error button:hover {
+  background-color: #b71c1c;
+}
+
+/* Error/Success Messages */
+.error-message {
+  padding: 12px 16px;
+  background-color: #ffebee;
+  border: 1px solid #ef5350;
+  border-radius: 6px;
+  color: #c62828;
+  margin-bottom: 16px;
+}
+
+.success-message {
+  padding: 12px 16px;
+  background-color: #e8f5e9;
+  border: 1px solid #66bb6a;
+  border-radius: 6px;
+  color: #2e7d32;
+  margin-bottom: 16px;
+}
+
+/* Dialog Actions */
+.settings-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid #e0e0e0;
+}
+
+.settings-dialog-actions button {
+  padding: 10px 24px;
+  border-radius: 6px;
+  font-size: 1rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+  border: 1px solid #d0d0d0;
+  background-color: #ffffff;
+  color: #333;
+}
+
+.settings-dialog-actions button:hover:not(:disabled) {
+  background-color: #f5f5f5;
+  border-color: #999;
+}
+
+.settings-dialog-actions button.primary {
+  background-color: #396cd8;
+  color: white;
+  border-color: #396cd8;
+}
+
+.settings-dialog-actions button.primary:hover:not(:disabled) {
+  background-color: #2d5ab8;
+  border-color: #2d5ab8;
+}
+
+.settings-dialog-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Dark Mode Support */
+@media (prefers-color-scheme: dark) {
+  .settings-dialog {
+    background-color: #1e1e1e;
+    color: #f6f6f6;
+  }
+
+  .settings-dialog-header {
+    border-bottom-color: #333;
+  }
+
+  .settings-dialog-header h2 {
+    color: #f6f6f6;
+  }
+
+  .close-button {
+    color: #999;
+  }
+
+  .close-button:hover {
+    background-color: #2a2a2a;
+    color: #f6f6f6;
+  }
+
+  .settings-section label {
+    color: #f6f6f6;
+  }
+
+  .settings-section select,
+  .device-selector select {
+    background-color: #2a2a2a;
+    border-color: #444;
+    color: #f6f6f6;
+  }
+
+  .settings-section select:hover,
+  .device-selector select:hover {
+    border-color: #666;
+  }
+
+  .settings-section select:focus,
+  .device-selector select:focus {
+    border-color: #396cd8;
+    box-shadow: 0 0 0 3px rgba(57, 108, 216, 0.2);
+  }
+
+  .help-text {
+    color: #999;
+  }
+
+  .no-devices {
+    background-color: #3a3000;
+    border-color: #ffc107;
+    color: #ffd54f;
+  }
+
+  .error-message {
+    background-color: #3a1a1a;
+    border-color: #ef5350;
+    color: #ef9a9a;
+  }
+
+  .success-message {
+    background-color: #1a3a1a;
+    border-color: #66bb6a;
+    color: #a5d6a7;
+  }
+
+  .settings-dialog-actions {
+    border-top-color: #333;
+  }
+
+  .settings-dialog-actions button {
+    background-color: #2a2a2a;
+    border-color: #444;
+    color: #f6f6f6;
+  }
+
+  .settings-dialog-actions button:hover:not(:disabled) {
+    background-color: #333;
+    border-color: #666;
+  }
+
+  .settings-dialog-actions button.primary {
+    background-color: #396cd8;
+    border-color: #396cd8;
+    color: white;
+  }
+
+  .settings-dialog-actions button.primary:hover:not(:disabled) {
+    background-color: #2d5ab8;
+    border-color: #2d5ab8;
+  }
+}

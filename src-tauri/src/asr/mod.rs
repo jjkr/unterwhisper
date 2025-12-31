@@ -7,7 +7,7 @@ pub mod dsp;
 pub mod transcribe;
 pub mod whisper;
 
-pub use audio::{AudioChunk, AudioRecorder, SAMPLE_RATE, CHANNELS};
+pub use audio::{AudioChunk, AudioRecorder, AudioDeviceInfo, DeviceId, SAMPLE_RATE, CHANNELS};
 pub use transcribe::{RealtimeTranscriber, TranscriberConfig, TranscriptionMerger, TranscriptionResult};
 pub use whisper::WhisperTransformer;
 

@@ -3,12 +3,14 @@ import reactLogo from "./assets/react.svg";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import TranscriptionWindow from "./TranscriptionWindow";
+import { SettingsDialog } from "./SettingsDialog";
 import "./App.css";
 
 function App() {
   const [greetMsg, setGreetMsg] = useState("");
   const [name, setName] = useState("");
   const [windowLabel, setWindowLabel] = useState("");
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   useEffect(() => {
     const getLabel = async () => {
@@ -61,6 +63,19 @@ function App() {
         <button type="submit">Greet</button>
       </form>
       <p>{greetMsg}</p>
+
+      {/* Settings Button */}
+      <div className="row" style={{ marginTop: '20px' }}>
+        <button onClick={() => setIsSettingsOpen(true)}>
+          Open Settings
+        </button>
+      </div>
+
+      {/* Settings Dialog */}
+      <SettingsDialog 
+        isOpen={isSettingsOpen} 
+        onClose={() => setIsSettingsOpen(false)} 
+      />
     </main>
   );
 }

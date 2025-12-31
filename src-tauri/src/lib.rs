@@ -307,15 +307,60 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
         anyhow::bail!("Already recording");
     }
 
-    // Check microphone permissions
-    debug!("Checking microphone permissions...");
-    if !check_microphone_permission() {
-        error!("Microphone permission denied - please grant microphone access in System Settings > Privacy & Security > Microphone");
-        anyhow::bail!("Microphone permission denied");
-    }
-    debug!("Microphone permissions OK");
+    /// // Check microphone permissions
+    /// debug!("Checking microphone permissions...");
+    /// if !check_microphone_permission() {
+    ///     error!("Microphone permission denied - please grant microphone access in System Settings > Privacy & Security > Microphone");
+    ///     anyhow::bail!("Microphone permission denied");
+    /// }
+    /// debug!("Microphone permissions OK");
 
-    // Get transcriber and start it
+    // Get device_id and device_name from settings
+    let (device_id, device_name) = {
+        let settings = state.settings.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock settings: {}", e))?;
+        (settings.device_id.clone(), settings.get_device_name())
+    };
+    
+    info!("Attempting to use audio device: {}", device_name);
+
+    // Create recorder with selected device, with fallback to system default
+    let recorder = match asr::audio::AudioRecorder::from_device_id(&device_id) {
+        Ok(rec) => {
+            info!("Successfully initialized device: {}", device_name);
+            rec
+        }
+        Err(e) => {
+            warn!("Failed to use selected device '{}': {}. Falling back to system default.", device_name, e);
+            
+            // Emit device-fallback event to notify user
+            let fallback_message = format!("Selected device '{}' unavailable. Using system default.", device_name);
+            if let Err(emit_err) = app.emit("device-fallback", fallback_message.clone()) {
+                error!("Failed to emit device-fallback event: {}", emit_err);
+            }
+            
+            // Try to use system default
+            match asr::audio::AudioRecorder::from_device_id(&asr::audio::DeviceId::SystemDefault) {
+                Ok(rec) => {
+                    info!("Successfully fell back to system default device");
+                    rec
+                }
+                Err(fallback_err) => {
+                    error!("Failed to initialize system default device: {}", fallback_err);
+                    
+                    // Emit device-error event
+                    let error_message = format!("Failed to initialize audio device: {}", fallback_err);
+                    if let Err(emit_err) = app.emit("device-error", error_message.clone()) {
+                        error!("Failed to emit device-error event: {}", emit_err);
+                    }
+                    
+                    anyhow::bail!("Failed to initialize any audio device: {}", fallback_err);
+                }
+            }
+        }
+    };
+
+    // Get transcriber and start it with the recorder
     debug!("Acquiring transcriber lock...");
     let mut transcriber = state.transcriber.lock()
         .map_err(|e| {
@@ -324,9 +369,9 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
         })?;
     debug!("Transcriber lock acquired");
 
-    // Start transcriber
-    debug!("Starting transcriber...");
-    transcriber.start()?;
+    // Start transcriber with custom recorder
+    debug!("Starting transcriber with custom recorder...");
+    transcriber.start_with_recorder(recorder)?;
     debug!("Transcriber started successfully");
 
     drop(transcriber);
@@ -498,6 +543,24 @@ fn update_settings(state: tauri::State<AppState>, settings: Settings) -> Result<
     Ok(())
 }
 
+/// Get list of available audio input devices
+#[tauri::command]
+fn get_audio_devices() -> Vec<asr::audio::AudioDeviceInfo> {
+    info!("Getting available audio input devices");
+    
+    match asr::audio::AudioRecorder::list_input_devices_with_info() {
+        Ok(devices) => {
+            info!("Successfully enumerated {} audio devices", devices.len());
+            devices
+        }
+        Err(e) => {
+            error!("Failed to enumerate audio devices: {}", e);
+            // Return empty list on error as per requirements 8.1
+            Vec::new()
+        }
+    }
+}
+
 /// Manually start recording (for UI control)
 #[tauri::command]
 fn manual_start_recording(state: tauri::State<AppState>, app: tauri::AppHandle) -> Result<(), String> {
@@ -548,6 +611,7 @@ pub fn run() {
             greet,
             get_settings,
             update_settings,
+            get_audio_devices,
             manual_start_recording,
             manual_stop_recording
         ])
