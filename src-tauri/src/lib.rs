@@ -9,6 +9,9 @@ fn greet(name: &str) -> String {
 }
 
 pub fn run() {
+
+    info!("🦉🦉🦉🦉🦉🦉🦉🦉 UNTER WHISPER STARTING 🦉🦉🦉🦉🦉🦉🦉🦉");
+
     let hotkey_manager = GlobalHotKeyManager::new().unwrap();
     let hotkey = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
     hotkey_manager.register(hotkey).unwrap();
