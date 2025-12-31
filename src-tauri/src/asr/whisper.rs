@@ -4,7 +4,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::whisper::{self as m, Config};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
-use tracing::{debug, info};
+use log::{debug, info};
 
 pub struct WhisperTransformer {
     model: m::model::Whisper,

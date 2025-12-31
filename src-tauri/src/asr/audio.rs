@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::Sender;
 use ringbuf::traits::Producer;
-use tracing::{debug, error, info, warn};
+use log::{debug, error, info, warn};
 
 pub const SAMPLE_RATE: u32 = 16000;
 pub const CHANNELS: u16 = 1;

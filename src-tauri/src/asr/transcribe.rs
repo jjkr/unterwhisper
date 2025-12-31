@@ -49,7 +49,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use log::{debug, info, warn};
 
 // Whisper constants
 const N_FFT: usize = 400; // Frame size 400 samples @ 16kHz = 25ms

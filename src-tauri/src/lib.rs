@@ -59,6 +59,9 @@ pub struct AppState {
     
     /// Application settings
     pub settings: Arc<Mutex<Settings>>,
+    
+    /// Global hotkey manager (kept alive for app lifetime)
+    pub hotkey_manager: Arc<Mutex<Option<GlobalHotKeyManager>>>,
 }
 
 impl AppState {
@@ -68,6 +71,7 @@ impl AppState {
             transcriber: Arc::new(Mutex::new(None)),
             is_recording: Arc::new(AtomicBool::new(false)),
             settings: Arc::new(Mutex::new(Settings::default())),
+            hotkey_manager: Arc::new(Mutex::new(None)),
         }
     }
     
@@ -77,6 +81,7 @@ impl AppState {
             transcriber: Arc::new(Mutex::new(None)),
             is_recording: Arc::new(AtomicBool::new(false)),
             settings: Arc::new(Mutex::new(settings)),
+            hotkey_manager: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -684,6 +689,10 @@ pub fn run() {
             }
 
             info!("Global hotkey registered successfully");
+            
+            // Store hotkey manager in AppState to keep it alive for app lifetime
+            let state = app.state::<AppState>();
+            *state.hotkey_manager.lock().unwrap() = Some(hotkey_manager);
             
             // Spawn background thread to poll for hotkey events
             spawn_hotkey_polling_thread(app.handle().clone());
