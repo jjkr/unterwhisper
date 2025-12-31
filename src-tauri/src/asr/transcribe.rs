@@ -160,8 +160,9 @@ pub struct RealtimeTranscriber {
     // Stream start time
     stream_start: Option<Instant>,
     
-    // Shutdown signal
+    // Shutdown signals (one for mel thread, whisper thread has its own)
     shutdown_tx: Option<Sender<()>>,
+    whisper_shutdown_tx: Option<Sender<()>>,
 }
 
 impl RealtimeTranscriber {
@@ -203,6 +204,7 @@ impl RealtimeTranscriber {
             whisper_thread: None,
             stream_start: None,
             shutdown_tx: None,
+            whisper_shutdown_tx: None,
         })
     }
     
@@ -226,16 +228,20 @@ impl RealtimeTranscriber {
         // Start audio capture directly with crossbeam channel
         self.audio_stream = Some(self.audio_recorder.start_streaming(pcm_tx)?);
 
-        // Create shutdown channel
-        let (shutdown_tx, shutdown_rx) = unbounded();
-        self.shutdown_tx = Some(shutdown_tx);
+        // Create separate shutdown channels for each thread
+        let (mel_shutdown_tx, mel_shutdown_rx) = unbounded();
+        let (whisper_shutdown_tx, whisper_shutdown_rx) = unbounded();
+        
+        // Store both shutdown senders
+        self.shutdown_tx = Some(mel_shutdown_tx);
+        self.whisper_shutdown_tx = Some(whisper_shutdown_tx);
 
         // Start mel encoding thread
         let pcm_rx = self.pcm_rx.take().expect("pcm_rx already taken");
-        self.start_mel_encoding_thread(pcm_rx, shutdown_rx.clone(), whisper_config.num_mel_bins);
+        self.start_mel_encoding_thread(pcm_rx, mel_shutdown_rx, whisper_config.num_mel_bins);
 
         // Start transcription thread
-        self.start_transcription_thread(whisper, shutdown_rx);
+        self.start_transcription_thread(whisper, whisper_shutdown_rx);
 
         info!("Transcription pipeline started successfully");
         Ok(())
@@ -465,6 +471,11 @@ impl RealtimeTranscriber {
                     };
 
                     debug!("MEL data size: {} frames", mel_data.len() / 3000);
+                    if mel_data.len() == 0 {
+                        debug!("Sleeping for 20ms");
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
 
                     let start_time = Instant::now();
 
@@ -530,9 +541,12 @@ impl RealtimeTranscriber {
     pub fn stop(&mut self) {
         info!("Stopping transcription pipeline");
 
-        // Send shutdown signal
+        // Send shutdown signals to both threads
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
+        }
+        if let Some(whisper_shutdown_tx) = self.whisper_shutdown_tx.take() {
+            let _ = whisper_shutdown_tx.send(());
         }
 
         // Drop the audio stream to stop capture
@@ -553,9 +567,12 @@ impl RealtimeTranscriber {
 
 impl Drop for RealtimeTranscriber {
     fn drop(&mut self) {
-        // Send shutdown signal
+        // Send shutdown signals to both threads
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
+        }
+        if let Some(whisper_shutdown_tx) = self.whisper_shutdown_tx.take() {
+            let _ = whisper_shutdown_tx.send(());
         }
         
         // Note: We don't join threads in Drop to avoid blocking
