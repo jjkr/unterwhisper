@@ -132,10 +132,8 @@ pub struct RealtimeTranscriber {
     audio_recorder: AudioRecorder,
     audio_stream: Option<cpal::Stream>,
 
-    // Whisper model config (for initialization)
-    model_name: String,
-    device: candle_core::Device,
-    language: Option<String>,
+    // Whisper model (shared across threads)
+    whisper: Arc<Mutex<WhisperTransformer>>,
 
     // PCM audio channel (raw audio chunks)
     pcm_tx: Option<Sender<AudioChunk>>,
@@ -181,6 +179,15 @@ impl RealtimeTranscriber {
             AudioRecorder::new()
         };
 
+        // Load Whisper model once
+        info!("Loading Whisper model: {}", config.model_name);
+        let whisper = WhisperTransformer::new(
+            &config.model_name,
+            device,
+            config.language.clone(),
+        )?;
+        let whisper = Arc::new(Mutex::new(whisper));
+
         // Create channels
         let (pcm_tx, pcm_rx) = unbounded();
         // let (mel_tx, mel_rx) = unbounded();
@@ -189,9 +196,7 @@ impl RealtimeTranscriber {
         Ok(Self {
             audio_recorder,
             audio_stream: None,
-            model_name: config.model_name,
-            device,
-            language: config.language,
+            whisper,
             pcm_tx: Some(pcm_tx),
             pcm_rx: Some(pcm_rx),
             // mel_tx,
@@ -217,13 +222,11 @@ impl RealtimeTranscriber {
         // Get the PCM sender for audio capture
         let pcm_tx = self.pcm_tx.take().expect("pcm_tx already taken");
 
-        // Load Whisper model to get config
-        let whisper = WhisperTransformer::new(
-            &self.model_name,
-            self.device.clone(),
-            self.language.clone(),
-        )?;
-        let whisper_config = whisper.config().clone();
+        // Get num_mel_bins from the Whisper model
+        let num_mel_bins = {
+            let whisper = self.whisper.lock().expect("Whisper lock poisoned");
+            whisper.config().num_mel_bins
+        };
 
         // Start audio capture directly with crossbeam channel
         self.audio_stream = Some(self.audio_recorder.start_streaming(pcm_tx)?);
@@ -238,10 +241,10 @@ impl RealtimeTranscriber {
 
         // Start mel encoding thread
         let pcm_rx = self.pcm_rx.take().expect("pcm_rx already taken");
-        self.start_mel_encoding_thread(pcm_rx, mel_shutdown_rx, whisper_config.num_mel_bins);
+        self.start_mel_encoding_thread(pcm_rx, mel_shutdown_rx, num_mel_bins);
 
         // Start transcription thread
-        self.start_transcription_thread(whisper, whisper_shutdown_rx);
+        self.start_transcription_thread(whisper_shutdown_rx);
 
         info!("Transcription pipeline started successfully");
         Ok(())
@@ -426,20 +429,23 @@ impl RealtimeTranscriber {
     }
 
     /// Start the transcription background thread
-    fn start_transcription_thread(&mut self, whisper: WhisperTransformer, shutdown_rx: Receiver<()>) {
+    fn start_transcription_thread(&mut self, shutdown_rx: Receiver<()>) {
         let transcription_tx = self.transcription_tx.clone();
         let stats = self.stats.clone();
         let stream_start = self.stream_start.unwrap();
         let mel_buffer = self.mel_buffer.clone();
+        let whisper = self.whisper.clone();
 
         let handle = thread::Builder::new()
             .name("whisper-inference".to_string())
             .spawn(move || {
                 info!("Transcription thread started");
 
-                // Rebind whisper as mut
-                let mut whisper = whisper;
-                let n_mel_bins = whisper.config().num_mel_bins;
+                // Get n_mel_bins from the shared Whisper model
+                let n_mel_bins = {
+                    let whisper_guard = whisper.lock().expect("Whisper lock poisoned");
+                    whisper_guard.config().num_mel_bins
+                };
 
                 loop {
                     // Check for shutdown signal (non-blocking)
@@ -490,8 +496,11 @@ impl RealtimeTranscriber {
 
                     let start_time = Instant::now();
 
-                    // Run Whisper transcription (blocking)
-                    let transcription_result = whisper.transcribe_from_mel(&mel_data);
+                    // Run Whisper transcription (blocking) with locked access
+                    let transcription_result = {
+                        let mut whisper_guard = whisper.lock().expect("Whisper lock poisoned");
+                        whisper_guard.transcribe_from_mel(&mel_data)
+                    };
 
                     match transcription_result {
                         Ok(text) => {
