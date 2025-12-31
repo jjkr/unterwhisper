@@ -128,22 +128,22 @@ This implementation plan breaks down the ONNX Transcriber feature into discrete 
     - Test error handling when special tokens are missing
     - _Requirements: 6.4_
 
-- [ ] 10. Implement repetition penalty logic
-  - [ ] 10.1 Create apply_repetition_penalty function
+- [-] 10. Implement repetition penalty logic
+  - [x] 10.1 Create apply_repetition_penalty function
     - Track token occurrence counts
     - Apply penalty factor (1.1) exponentially based on count
     - Divide positive logits, multiply negative logits
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5_
 
-- [ ] 11. Implement token sampling and generation
-  - [ ] 11.1 Create sample_token method
+- [x] 11. Implement token sampling and generation
+  - [x] 11.1 Create sample_token method
     - Extract logits for last position
     - Apply repetition penalty
     - Apply temperature if > 0
     - Select token greedily (temperature 0) or sample (temperature > 0)
     - _Requirements: 3.3_
 
-  - [ ] 11.2 Create generate_tokens method
+  - [x] 11.2 Create generate_tokens method
     - Initialize token sequence
     - Loop until EOT or max_length
     - Run decoder with current tokens and audio features
@@ -168,11 +168,11 @@ This implementation plan breaks down the ONNX Transcriber feature into discrete 
     - Verify sequences end with EOT or at max_length
     - _Requirements: 3.4, 3.5_
 
-- [ ] 12. Checkpoint - Ensure token generation tests pass
+- [x] 12. Checkpoint - Ensure token generation tests pass
   - Ensure all tests pass, ask the user if questions arise.
 
-- [ ] 13. Implement decoder inference
-  - [ ] 13.1 Create run_decoder method
+- [x] 13. Implement decoder inference
+  - [x] 13.1 Create run_decoder method
     - Accept input tokens and audio features
     - Optionally accept past key-values cache
     - Run decoder ONNX session
@@ -184,8 +184,8 @@ This implementation plan breaks down the ONNX Transcriber feature into discrete 
     - Test decoder produces logits with correct shape
     - _Requirements: 3.2_
 
-- [ ] 14. Implement token decoding and text cleanup
-  - [ ] 14.1 Create decode_and_clean method
+- [x] 14. Implement token decoding and text cleanup
+  - [x] 14.1 Create decode_and_clean method
     - Decode token sequence using tokenizer
     - Remove special tokens: <|startoftranscript|>, <|transcribe|>, <|notimestamps|>, <|endoftext|>, <|en|>
     - Trim leading and trailing whitespace
@@ -213,8 +213,8 @@ This implementation plan breaks down the ONNX Transcriber feature into discrete 
     - Verify output has no leading/trailing whitespace
     - _Requirements: 4.4_
 
-- [ ] 15. Implement main transcribe_from_mel method
-  - [ ] 15.1 Wire together the complete transcription pipeline
+- [x] 15. Implement main transcribe_from_mel method
+  - [x] 15.1 Wire together the complete transcription pipeline
     - Preprocess mel spectrogram
     - Run encoder to get audio features
     - Initialize tokens

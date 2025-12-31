@@ -332,6 +332,10 @@ impl OnnxTranscriber {
 
     /// Transcribes audio from a mel spectrogram.
     ///
+    /// This is the main entry point for transcription. It orchestrates the complete
+    /// pipeline from mel spectrogram preprocessing through token generation to final
+    /// text output.
+    ///
     /// # Arguments
     ///
     /// * `mel_spectrogram` - Flattened mel spectrogram data as a slice of f32 values
@@ -340,18 +344,45 @@ impl OnnxTranscriber {
     ///
     /// Returns a `Result` containing the transcribed text or an error if transcription fails.
     ///
+    /// # Pipeline Steps
+    ///
+    /// 1. **Preprocess**: Normalize mel spectrogram to 3000 frames (pad or truncate)
+    /// 2. **Encode**: Run encoder to extract audio features
+    /// 3. **Initialize**: Create initial token sequence with special tokens
+    /// 4. **Generate**: Autoregressively generate tokens using decoder
+    /// 5. **Decode**: Convert tokens to text
+    /// 6. **Clean**: Remove special tokens and trim whitespace
+    ///
     /// # Example
     ///
     /// ```no_run
     /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
     /// # use candle_core::Device;
-    /// # let transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
     /// let mel_spectrogram: Vec<f32> = vec![/* ... */];
     /// let text = transcriber.transcribe_from_mel(&mel_spectrogram)?;
+    /// println!("Transcription: {}", text);
     /// ```
-    pub fn transcribe_from_mel(&mut self, _mel_spectrogram: &[f32]) -> Result<String> {
-        // TODO: Implement transcription pipeline
-        unimplemented!("OnnxTranscriber::transcribe_from_mel will be implemented in subsequent tasks")
+    pub fn transcribe_from_mel(&mut self, mel_spectrogram: &[f32]) -> Result<String> {
+        // Step 1: Preprocess mel spectrogram
+        let mel_tensor = match self.preprocess_mel(mel_spectrogram) {
+            Some(tensor) => tensor,
+            None => {
+                // Empty input returns empty string
+                return Ok(String::new());
+            }
+        };
+
+        // Step 2: Run encoder to get audio features
+        let audio_features = self.run_encoder(&mel_tensor)?;
+
+        // Step 3: Generate tokens with decoder
+        let tokens = self.generate_tokens(&audio_features)?;
+
+        // Step 4: Decode and clean text
+        let text = self.decode_and_clean(&tokens)?;
+
+        Ok(text)
     }
 
     /// Preprocesses a mel spectrogram for encoder input.
@@ -584,6 +615,432 @@ impl OnnxTranscriber {
         ];
         
         Ok(tokens)
+    }
+
+    /// Applies repetition penalty to logits to discourage repeated tokens.
+    ///
+    /// This function modifies the logits in-place by applying a penalty to tokens
+    /// that have already appeared in the generated sequence. The penalty is applied
+    /// exponentially based on how many times each token has occurred.
+    ///
+    /// # Arguments
+    ///
+    /// * `logits` - Mutable slice of logits to modify (one value per vocabulary token)
+    /// * `tokens` - The sequence of tokens generated so far
+    /// * `penalty` - The penalty factor to apply (typically 1.1)
+    ///
+    /// # Penalty Application
+    ///
+    /// For each token that has appeared in the sequence:
+    /// - Count how many times it has occurred
+    /// - Calculate penalty_factor = penalty^count
+    /// - If logit > 0: divide by penalty_factor (reduce probability)
+    /// - If logit ≤ 0: multiply by penalty_factor (further reduce probability)
+    ///
+    /// This approach ensures that:
+    /// - Repeated tokens become less likely to be selected again
+    /// - The penalty increases exponentially with repetition count
+    /// - Both positive and negative logits are penalized appropriately
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
+    /// let mut logits = vec![2.0, -1.0, 0.5, -0.5];
+    /// let tokens = vec![0, 0, 2]; // Token 0 appears twice, token 2 once
+    /// let penalty = 1.1;
+    /// 
+    /// // After applying penalty:
+    /// // logits[0] = 2.0 / (1.1^2) ≈ 1.65 (appeared twice)
+    /// // logits[1] = -1.0 (unchanged, never appeared)
+    /// // logits[2] = 0.5 / 1.1 ≈ 0.45 (appeared once)
+    /// // logits[3] = -0.5 (unchanged, never appeared)
+    /// ```
+    fn apply_repetition_penalty(logits: &mut [f32], tokens: &[u32], penalty: f32) {
+        use std::collections::HashMap;
+
+        // Track how many times each token has occurred
+        let mut token_counts: HashMap<u32, i32> = HashMap::new();
+        for &token in tokens {
+            *token_counts.entry(token).or_insert(0) += 1;
+        }
+
+        // Apply penalty to each token that has occurred
+        for (token_id, count) in token_counts {
+            let idx = token_id as usize;
+            if idx < logits.len() {
+                // Calculate penalty factor: penalty^count
+                let penalty_factor = penalty.powi(count);
+                
+                // Apply penalty based on logit sign
+                if logits[idx] > 0.0 {
+                    // Positive logits: divide by penalty factor
+                    logits[idx] /= penalty_factor;
+                } else {
+                    // Negative logits: multiply by penalty factor
+                    logits[idx] *= penalty_factor;
+                }
+            }
+        }
+    }
+
+    /// Samples a token from the decoder logits.
+    ///
+    /// This method extracts the logits for the last position in the sequence,
+    /// applies repetition penalty to discourage repeated tokens, optionally
+    /// applies temperature for sampling, and selects the next token either
+    /// greedily (temperature 0) or by sampling (temperature > 0).
+    ///
+    /// # Arguments
+    ///
+    /// * `logits` - The logits tensor from the decoder output, shape `(batch_size, sequence_length, vocab_size)`
+    /// * `tokens` - The current token sequence (used for repetition penalty)
+    /// * `temperature` - Temperature for sampling (0.0 for greedy, > 0.0 for sampling)
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing the selected token ID as a `u32`, or an error
+    /// if sampling fails.
+    ///
+    /// # Sampling Strategy
+    ///
+    /// - **Temperature 0.0 (Greedy)**: Selects the token with the highest logit value
+    /// - **Temperature > 0.0 (Sampling)**: Applies softmax with temperature and samples
+    ///   from the resulting probability distribution
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
+    /// # use candle_core::Device;
+    /// # use ndarray::Array3;
+    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// let logits = Array3::<f32>::zeros((1, 10, 51865));
+    /// let tokens = vec![50258, 50259, 50359, 50363];
+    /// let temperature = 0.0; // Greedy decoding
+    /// let next_token = transcriber.sample_token(&logits, &tokens, temperature)?;
+    /// ```
+    fn sample_token(
+        &self,
+        logits: &ndarray::Array3<f32>,
+        tokens: &[u32],
+        temperature: f32,
+    ) -> Result<u32> {
+        // Extract logits for the last position
+        // Shape: (batch_size, sequence_length, vocab_size)
+        // We want: (vocab_size,) for the last position
+        let shape = logits.shape();
+        if shape.len() != 3 {
+            return Err(anyhow!("Expected 3D logits tensor, got {}D", shape.len()));
+        }
+        
+        let batch_size = shape[0];
+        let seq_len = shape[1];
+        let vocab_size = shape[2];
+        
+        if batch_size != 1 {
+            return Err(anyhow!("Expected batch_size=1, got {}", batch_size));
+        }
+        
+        if seq_len == 0 {
+            return Err(anyhow!("Empty sequence in logits"));
+        }
+        
+        // Extract last position logits: logits[0, seq_len-1, :]
+        let last_logits = logits.slice(ndarray::s![0, seq_len - 1, ..]);
+        let mut last_logits_vec: Vec<f32> = last_logits.to_vec();
+        
+        // Apply repetition penalty
+        let penalty = 1.1; // Default repetition penalty
+        Self::apply_repetition_penalty(&mut last_logits_vec, tokens, penalty);
+        
+        // Select token based on temperature
+        if temperature == 0.0 {
+            // Greedy decoding: select token with highest logit
+            let max_idx = last_logits_vec
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx)
+                .ok_or_else(|| anyhow!("Failed to find maximum logit"))?;
+            
+            Ok(max_idx as u32)
+        } else {
+            // Sampling with temperature
+            // Apply temperature scaling: logits / temperature
+            for logit in last_logits_vec.iter_mut() {
+                *logit /= temperature;
+            }
+            
+            // Apply softmax to get probabilities
+            let max_logit = last_logits_vec
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            
+            // Subtract max for numerical stability
+            for logit in last_logits_vec.iter_mut() {
+                *logit -= max_logit;
+            }
+            
+            // Compute exp and sum
+            let exp_logits: Vec<f32> = last_logits_vec.iter().map(|x| x.exp()).collect();
+            let sum_exp: f32 = exp_logits.iter().sum();
+            
+            // Normalize to get probabilities
+            let probs: Vec<f32> = exp_logits.iter().map(|x| x / sum_exp).collect();
+            
+            // Sample from the distribution
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let sample: f32 = rng.gen();
+            
+            let mut cumsum = 0.0;
+            for (idx, &prob) in probs.iter().enumerate() {
+                cumsum += prob;
+                if sample < cumsum {
+                    return Ok(idx as u32);
+                }
+            }
+            
+            // Fallback: return last token (should rarely happen due to floating point)
+            Ok((vocab_size - 1) as u32)
+        }
+    }
+
+    /// Runs the decoder model on input tokens and audio features.
+    ///
+    /// This method executes the ONNX decoder session to produce logits for the
+    /// next token prediction. The decoder runs autoregressively, taking the current
+    /// token sequence and audio features as input.
+    ///
+    /// # Arguments
+    ///
+    /// * `input_tokens` - Current token sequence as a slice of u32 values
+    /// * `audio_features` - Audio features from the encoder, shape `(1, sequence_length, hidden_size)`
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing the logits as an `Array3<f32>` with shape
+    /// `(1, sequence_length, vocab_size)`, or an error if inference fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The ONNX session execution fails
+    /// - The output tensor extraction fails
+    /// - The output shape is invalid
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
+    /// # use candle_core::Device;
+    /// # use ndarray::Array3;
+    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// let tokens = vec![50258, 50259, 50359, 50363];
+    /// let audio_features = Array3::<f32>::zeros((1, 1500, 384));
+    /// let logits = transcriber.run_decoder(&tokens, &audio_features)?;
+    /// ```
+    fn run_decoder(
+        &mut self,
+        input_tokens: &[u32],
+        audio_features: &Array3<f32>,
+    ) -> Result<Array3<f32>> {
+        use ndarray::Array2;
+        use ort::value::Value;
+
+        // Convert tokens to i64 array (ONNX typically uses int64 for token IDs)
+        let tokens_i64: Vec<i64> = input_tokens.iter().map(|&t| t as i64).collect();
+        let seq_len = tokens_i64.len();
+        
+        // Create input_ids tensor: shape (batch_size, sequence_length)
+        let input_ids = Array2::from_shape_vec((1, seq_len), tokens_i64)
+            .map_err(|e| anyhow!("Failed to create input_ids array: {}", e))?;
+        
+        let input_ids_value = Value::from_array(input_ids)
+            .map_err(|e| anyhow!("Failed to create ONNX value from input_ids: {}", e))?;
+        
+        let audio_features_value = Value::from_array(audio_features.clone())
+            .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
+
+        // Run decoder session
+        let outputs = self.decoder_session
+            .run(ort::inputs![
+                "input_ids" => input_ids_value,
+                "encoder_hidden_states" => audio_features_value
+            ])
+            .map_err(|e| anyhow!("Decoder inference failed: {}", e))?;
+
+        // Extract logits from the output
+        let logits = outputs["logits"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| anyhow!("Failed to extract logits from decoder output: {}", e))?;
+
+        // Get the shape and data
+        let (shape, data) = logits;
+        
+        // Convert shape to dimensions
+        let dims = shape.as_ref();
+        if dims.len() != 3 {
+            return Err(anyhow!("Expected 3D logits, got {}D", dims.len()));
+        }
+
+        // Convert i64 dimensions to usize
+        let dim0 = dims[0] as usize;
+        let dim1 = dims[1] as usize;
+        let dim2 = dims[2] as usize;
+
+        // Create Array3 from the data
+        let logits_array = Array3::from_shape_vec(
+            (dim0, dim1, dim2),
+            data.to_vec()
+        ).map_err(|e| anyhow!("Failed to create logits array: {}", e))?;
+
+        Ok(logits_array)
+    }
+
+    /// Generates a sequence of tokens from audio features.
+    ///
+    /// This method implements the autoregressive token generation loop for the
+    /// Whisper decoder. It starts with an initial token sequence (including special
+    /// tokens), then iteratively runs the decoder to predict the next token until
+    /// either the end-of-text token is generated or the maximum length is reached.
+    ///
+    /// # Arguments
+    ///
+    /// * `audio_features` - Audio features from the encoder, shape `(1, sequence_length, hidden_size)`
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing the generated token sequence as a `Vec<u32>`,
+    /// or an error if generation fails.
+    ///
+    /// # Generation Process
+    ///
+    /// 1. Initialize token sequence with special tokens (SOT, LANG, TRANSCRIBE, NO_TIMESTAMPS)
+    /// 2. Loop until stopping condition:
+    ///    - Run decoder with current tokens and audio features
+    ///    - Sample next token from logits (using greedy decoding by default)
+    ///    - Append token to sequence
+    ///    - Check for end-of-text token or max length
+    /// 3. Return complete token sequence
+    ///
+    /// # Stopping Conditions
+    ///
+    /// Generation stops when:
+    /// - The end-of-text token (`<|endoftext|>`) is generated
+    /// - The sequence reaches the maximum length (from model config)
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
+    /// # use candle_core::Device;
+    /// # use ndarray::Array3;
+    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// let audio_features = Array3::<f32>::zeros((1, 1500, 384));
+    /// let tokens = transcriber.generate_tokens(&audio_features)?;
+    /// println!("Generated {} tokens", tokens.len());
+    /// ```
+    fn generate_tokens(&mut self, audio_features: &Array3<f32>) -> Result<Vec<u32>> {
+        // Initialize token sequence with special tokens
+        let mut tokens = self.initialize_tokens()?;
+        
+        // Get end-of-text token ID
+        let eot_token = self.get_token_id("<|endoftext|>")?;
+        
+        // Get maximum length from config
+        let max_length = self.config.max_length;
+        
+        // Temperature for sampling (0.0 = greedy decoding)
+        let temperature = 0.0;
+        
+        // Generate tokens until EOT or max_length
+        loop {
+            // Check if we've reached max length
+            if tokens.len() >= max_length {
+                break;
+            }
+            
+            // Run decoder with current tokens and audio features
+            let logits = self.run_decoder(&tokens, audio_features)?;
+            
+            // Sample next token
+            let next_token = self.sample_token(&logits, &tokens, temperature)?;
+            
+            // Append token to sequence
+            tokens.push(next_token);
+            
+            // Check for end-of-text token
+            if next_token == eot_token {
+                break;
+            }
+        }
+        
+        Ok(tokens)
+    }
+
+    /// Decodes a token sequence to text and removes special tokens.
+    ///
+    /// This method converts a sequence of token IDs back into human-readable text
+    /// using the tokenizer, then cleans up the output by removing Whisper's special
+    /// tokens and trimming whitespace.
+    ///
+    /// # Arguments
+    ///
+    /// * `tokens` - The token sequence to decode (as a slice of u32 values)
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing the cleaned transcription text as a `String`,
+    /// or an error if decoding fails.
+    ///
+    /// # Cleaning Process
+    ///
+    /// 1. Decode tokens to text using the tokenizer
+    /// 2. Remove special tokens:
+    ///    - `<|startoftranscript|>` - Start of transcript marker
+    ///    - `<|transcribe|>` - Task indicator
+    ///    - `<|notimestamps|>` - Timestamp mode indicator
+    ///    - `<|endoftext|>` - End of text marker
+    ///    - `<|en|>` - Language indicator
+    /// 3. Trim leading and trailing whitespace
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The tokenizer fails to decode the token sequence
+    /// - The token sequence contains invalid token IDs
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
+    /// # use candle_core::Device;
+    /// # let transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// let tokens = vec![50258, 50259, 50359, 50363, 1234, 5678, 50257];
+    /// let text = transcriber.decode_and_clean(&tokens)?;
+    /// println!("Transcription: {}", text);
+    /// ```
+    fn decode_and_clean(&self, tokens: &[u32]) -> Result<String> {
+        // Decode tokens to text using the tokenizer
+        // skip_special_tokens=false because we want to manually remove specific ones
+        let text = self.tokenizer
+            .decode(tokens, false)
+            .map_err(|e| anyhow!("Tokenizer decode failed: {}", e))?;
+        
+        // Remove special tokens
+        let cleaned = text
+            .replace("<|startoftranscript|>", "")
+            .replace("<|transcribe|>", "")
+            .replace("<|notimestamps|>", "")
+            .replace("<|endoftext|>", "")
+            .replace("<|en|>", "")
+            .trim()
+            .to_string();
+        
+        Ok(cleaned)
     }
 }
 
@@ -845,4 +1302,160 @@ mod tests {
         // - All tokens should be valid u32 values
         // These will be tested in integration tests with actual models
     }
+
+    #[test]
+    fn test_apply_repetition_penalty_no_repetitions() {
+        // Test that penalty is not applied when tokens haven't been repeated
+        let mut logits = vec![2.0, -1.0, 0.5, -0.5, 1.0];
+        let tokens = vec![0, 1, 2, 3]; // Each token appears once
+        let penalty = 1.1;
+        
+        let original_logits = logits.clone();
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // All logits should be penalized once (appeared once)
+        assert!((logits[0] - original_logits[0] / penalty).abs() < 1e-6);
+        assert!((logits[1] - original_logits[1] * penalty).abs() < 1e-6);
+        assert!((logits[2] - original_logits[2] / penalty).abs() < 1e-6);
+        assert!((logits[3] - original_logits[3] * penalty).abs() < 1e-6);
+        // Token 4 never appeared, should be unchanged
+        assert_eq!(logits[4], original_logits[4]);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_with_repetitions() {
+        // Test that penalty increases exponentially with repetition count
+        let mut logits = vec![2.0, -1.0, 0.5, -0.5];
+        let tokens = vec![0, 0, 0, 2]; // Token 0 appears 3 times, token 2 once
+        let penalty = 1.1;
+        
+        let original_logits = logits.clone();
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // Token 0 appeared 3 times: penalty^3
+        let expected_0 = original_logits[0] / penalty.powi(3);
+        assert!((logits[0] - expected_0).abs() < 1e-6);
+        
+        // Token 1 never appeared: unchanged
+        assert_eq!(logits[1], original_logits[1]);
+        
+        // Token 2 appeared once: penalty^1
+        let expected_2 = original_logits[2] / penalty;
+        assert!((logits[2] - expected_2).abs() < 1e-6);
+        
+        // Token 3 never appeared: unchanged
+        assert_eq!(logits[3], original_logits[3]);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_positive_logits() {
+        // Test that positive logits are divided by penalty factor
+        let mut logits = vec![2.0, 3.0, 1.5];
+        let tokens = vec![0, 1]; // Tokens 0 and 1 each appear once
+        let penalty = 1.1;
+        
+        let original_logits = logits.clone();
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // Positive logits should be divided
+        assert!((logits[0] - original_logits[0] / penalty).abs() < 1e-6);
+        assert!((logits[1] - original_logits[1] / penalty).abs() < 1e-6);
+        // Token 2 never appeared: unchanged
+        assert_eq!(logits[2], original_logits[2]);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_negative_logits() {
+        // Test that negative logits are multiplied by penalty factor
+        let mut logits = vec![-2.0, -1.0, -0.5];
+        let tokens = vec![0, 1]; // Tokens 0 and 1 each appear once
+        let penalty = 1.1;
+        
+        let original_logits = logits.clone();
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // Negative logits should be multiplied (making them more negative)
+        assert!((logits[0] - original_logits[0] * penalty).abs() < 1e-6);
+        assert!((logits[1] - original_logits[1] * penalty).abs() < 1e-6);
+        // Token 2 never appeared: unchanged
+        assert_eq!(logits[2], original_logits[2]);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_mixed_logits() {
+        // Test with a mix of positive and negative logits
+        let mut logits = vec![2.0, -1.0, 0.5, -0.5, 0.0];
+        let tokens = vec![0, 1, 2, 3]; // Each appears once
+        let penalty = 1.1;
+        
+        let original_logits = logits.clone();
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // Positive logits divided
+        assert!((logits[0] - original_logits[0] / penalty).abs() < 1e-6);
+        assert!((logits[2] - original_logits[2] / penalty).abs() < 1e-6);
+        
+        // Negative logits multiplied
+        assert!((logits[1] - original_logits[1] * penalty).abs() < 1e-6);
+        assert!((logits[3] - original_logits[3] * penalty).abs() < 1e-6);
+        
+        // Zero logit stays zero (0 * penalty = 0)
+        assert_eq!(logits[4], 0.0);
+        
+        // Token 4 never appeared: unchanged
+        assert_eq!(logits[4], original_logits[4]);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_empty_tokens() {
+        // Test that no penalty is applied when token sequence is empty
+        let mut logits = vec![2.0, -1.0, 0.5];
+        let tokens: Vec<u32> = vec![]; // Empty token sequence
+        let penalty = 1.1;
+        
+        let original_logits = logits.clone();
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // All logits should remain unchanged
+        assert_eq!(logits, original_logits);
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_out_of_bounds_token() {
+        // Test that out-of-bounds token IDs are safely ignored
+        let mut logits = vec![2.0, -1.0, 0.5];
+        let tokens = vec![0, 100]; // Token 100 is out of bounds
+        let penalty = 1.1;
+        
+        let original_logits = logits.clone();
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // Token 0 should be penalized
+        assert!((logits[0] - original_logits[0] / penalty).abs() < 1e-6);
+        
+        // Tokens 1 and 2 should be unchanged (never appeared)
+        assert_eq!(logits[1], original_logits[1]);
+        assert_eq!(logits[2], original_logits[2]);
+        
+        // No panic should occur from out-of-bounds token
+    }
+
+    #[test]
+    fn test_apply_repetition_penalty_exponential_growth() {
+        // Test that penalty grows exponentially with repetition count
+        let mut logits = vec![10.0, 10.0, 10.0];
+        let tokens = vec![0, 0, 0, 0, 0]; // Token 0 appears 5 times
+        let penalty = 1.1;
+        
+        OnnxTranscriber::apply_repetition_penalty(&mut logits, &tokens, penalty);
+        
+        // Token 0 should have penalty^5 applied
+        let expected = 10.0 / penalty.powi(5);
+        assert!((logits[0] - expected).abs() < 1e-6);
+        
+        // Tokens 1 and 2 should be unchanged
+        assert_eq!(logits[1], 10.0);
+        assert_eq!(logits[2], 10.0);
+    }
 }
+
