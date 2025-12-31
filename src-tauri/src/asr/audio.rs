@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 use ringbuf::traits::Producer;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
+use rubato::{Resampler, FftFixedInOut};
 use std::sync::{Arc, Mutex};
 
 pub const SAMPLE_RATE: u32 = 16000;
@@ -60,21 +60,15 @@ pub struct AudioRecorder {
 }
 
 /// Create a resampler for converting from one sample rate to another
-fn create_resampler(from_rate: u32, to_rate: u32) -> Result<SincFixedIn<f32>> {
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
-        window: WindowFunction::BlackmanHarris2,
-    };
+fn create_resampler(from_rate: u32, to_rate: u32) -> Result<FftFixedInOut<f32>> {
+    // Use a smaller chunk size that's more likely to match audio buffer sizes
+    let chunk_size = 512; // Common audio buffer size
     
-    let resampler = SincFixedIn::<f32>::new(
-        to_rate as f64 / from_rate as f64,
-        2.0, // max_resample_ratio_relative
-        params,
-        1024, // chunk_size
-        1,    // num_channels
+    let resampler = FftFixedInOut::<f32>::new(
+        from_rate as usize,
+        to_rate as usize,
+        chunk_size,
+        1, // num_channels
     )?;
     
     Ok(resampler)
@@ -228,13 +222,16 @@ impl AudioRecorder {
 
         // Create resampler if needed
         let needs_resampling = native_sample_rate != self.sample_rate;
-        let resampler: Option<Arc<Mutex<SincFixedIn<f32>>>> = if needs_resampling {
+        let resampler: Option<Arc<Mutex<FftFixedInOut<f32>>>> = if needs_resampling {
             info!("Creating resampler: {}Hz -> {}Hz", native_sample_rate, self.sample_rate);
             Some(Arc::new(Mutex::new(create_resampler(native_sample_rate, self.sample_rate)?)))
         } else {
             info!("No resampling needed");
             None
         };
+        
+        // Buffer to accumulate samples for resampling (512 samples = chunk size)
+        let input_buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 
         let err_fn = |err| error!("Audio stream error: {}", err);
 
@@ -245,6 +242,14 @@ impl AudioRecorder {
                 
                 // Resample if needed
                 let samples_to_push = if let Some(ref resampler_arc) = resampler {
+                    let mut buffer = match input_buffer.lock() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            error!("Failed to lock input buffer: {}", e);
+                            return;
+                        }
+                    };
+                    
                     let mut resampler = match resampler_arc.lock() {
                         Ok(r) => r,
                         Err(e) => {
@@ -253,30 +258,41 @@ impl AudioRecorder {
                         }
                     };
                     
-                    // Prepare input for resampler (needs Vec<Vec<f32>> for multi-channel)
-                    let input_frames = vec![data.to_vec()];
+                    // Add new samples to buffer
+                    buffer.extend_from_slice(data);
                     
-                    // Process resampling
-                    match resampler.process(&input_frames, None) {
-                        Ok(output_frames) => {
-                            // Extract the resampled data from the first channel
-                            output_frames[0].clone()
-                        }
-                        Err(e) => {
-                            error!("Resampling error: {}", e);
-                            return;
+                    let chunk_size = resampler.input_frames_next();
+                    let mut output_samples = Vec::new();
+                    
+                    // Process complete chunks
+                    while buffer.len() >= chunk_size {
+                        let chunk: Vec<f32> = buffer.drain(..chunk_size).collect();
+                        let input_frames = vec![chunk];
+                        
+                        match resampler.process(&input_frames, None) {
+                            Ok(output_frames) => {
+                                output_samples.extend_from_slice(&output_frames[0]);
+                            }
+                            Err(e) => {
+                                error!("Resampling error: {}", e);
+                                return;
+                            }
                         }
                     }
+                    
+                    output_samples
                 } else {
                     // No resampling needed, use data as-is
                     data.to_vec()
                 };
                 
                 // Push samples to ringbuf (non-blocking)
-                let pushed = producer.push_slice(&samples_to_push);
-                
-                if pushed < samples_to_push.len() {
-                    warn!("Ringbuf full: dropped {} samples out of {}", samples_to_push.len() - pushed, samples_to_push.len());
+                if !samples_to_push.is_empty() {
+                    let pushed = producer.push_slice(&samples_to_push);
+                    
+                    if pushed < samples_to_push.len() {
+                        warn!("Ringbuf full: dropped {} samples out of {}", samples_to_push.len() - pushed, samples_to_push.len());
+                    }
                 }
             },
             err_fn,
@@ -336,13 +352,16 @@ impl AudioRecorder {
 
         // Create resampler if needed
         let needs_resampling = native_sample_rate != self.sample_rate;
-        let resampler: Option<Arc<Mutex<SincFixedIn<f32>>>> = if needs_resampling {
+        let resampler: Option<Arc<Mutex<FftFixedInOut<f32>>>> = if needs_resampling {
             info!("Creating resampler: {}Hz -> {}Hz", native_sample_rate, self.sample_rate);
             Some(Arc::new(Mutex::new(create_resampler(native_sample_rate, self.sample_rate)?)))
         } else {
             info!("No resampling needed");
             None
         };
+        
+        // Buffer to accumulate samples for resampling (512 samples = chunk size)
+        let input_buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
 
         let err_fn = |err| error!("Audio stream error: {}", err);
 
@@ -353,6 +372,14 @@ impl AudioRecorder {
                 
                 // Resample if needed
                 let samples = if let Some(ref resampler_arc) = resampler {
+                    let mut buffer = match input_buffer.lock() {
+                        Ok(b) => b,
+                        Err(e) => {
+                            error!("Failed to lock input buffer: {}", e);
+                            return;
+                        }
+                    };
+                    
                     let mut resampler = match resampler_arc.lock() {
                         Ok(r) => r,
                         Err(e) => {
@@ -361,31 +388,42 @@ impl AudioRecorder {
                         }
                     };
                     
-                    // Prepare input for resampler (needs Vec<Vec<f32>> for multi-channel)
-                    let input_frames = vec![data.to_vec()];
+                    // Add new samples to buffer
+                    buffer.extend_from_slice(data);
                     
-                    // Process resampling
-                    match resampler.process(&input_frames, None) {
-                        Ok(output_frames) => {
-                            // Extract the resampled data from the first channel
-                            output_frames[0].clone()
-                        }
-                        Err(e) => {
-                            error!("Resampling error: {}", e);
-                            return;
+                    let chunk_size = resampler.input_frames_next();
+                    let mut output_samples = Vec::new();
+                    
+                    // Process complete chunks
+                    while buffer.len() >= chunk_size {
+                        let chunk: Vec<f32> = buffer.drain(..chunk_size).collect();
+                        let input_frames = vec![chunk];
+                        
+                        match resampler.process(&input_frames, None) {
+                            Ok(output_frames) => {
+                                output_samples.extend_from_slice(&output_frames[0]);
+                            }
+                            Err(e) => {
+                                error!("Resampling error: {}", e);
+                                return;
+                            }
                         }
                     }
+                    
+                    output_samples
                 } else {
                     // No resampling needed, use data as-is
                     data.to_vec()
                 };
                 
                 // Send audio data
-                let chunk = AudioChunk::new(samples);
-                
-                if let Err(e) = tx.send(chunk) {
-                    error!("Failed to send audio chunk: {}", e);
-                    return;
+                if !samples.is_empty() {
+                    let chunk = AudioChunk::new(samples);
+                    
+                    if let Err(e) = tx.send(chunk) {
+                        error!("Failed to send audio chunk: {}", e);
+                        return;
+                    }
                 }
             },
             err_fn,
