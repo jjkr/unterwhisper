@@ -52,21 +52,31 @@ fn check_microphone_permission() -> bool {
 /// Application state shared across Tauri commands and event handlers
 pub struct AppState {
     /// The real-time transcriber instance (created once, reused)
-    pub transcriber: Arc<Mutex<RealtimeTranscriber>>,
+    pub transcriber: Arc<Mutex<Option<RealtimeTranscriber>>>,
     
     /// Flag indicating whether recording is currently active
     pub is_recording: Arc<AtomicBool>,
     
     /// Application settings
-    pub settings: Arc<Mutex<Settings>>,
+    pub settings: Arc<Mutex<Option<Settings>>>,
     
     /// Global hotkey manager (kept alive for app lifetime)
     pub hotkey_manager: Arc<Mutex<Option<GlobalHotKeyManager>>>,
 }
 
 impl AppState {
-    /// Create a new AppState with transcriber initialized
-    pub fn with_settings(settings: Settings) -> anyhow::Result<Self> {
+    /// Create a new empty AppState
+    pub fn new() -> Self {
+        Self {
+            transcriber: Arc::new(Mutex::new(None)),
+            is_recording: Arc::new(AtomicBool::new(false)),
+            settings: Arc::new(Mutex::new(None)),
+            hotkey_manager: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Initialize the transcriber and settings
+    pub fn initialize_with_settings(&self, settings: Settings) -> anyhow::Result<()> {
         info!("Initializing AppState with transcriber");
         
         // Create transcriber config from settings
@@ -76,21 +86,55 @@ impl AppState {
             ..Default::default()
         };
         
-        // Create device (Metal for macOS)
-        let device = Device::new_metal(0)?;
-        
         // Create transcriber once
-        let transcriber = RealtimeTranscriber::new(config, device)?;
+        let transcriber = RealtimeTranscriber::new(config)?;
         
         info!("Transcriber created successfully");
         
-        Ok(Self {
-            transcriber: Arc::new(Mutex::new(transcriber)),
-            is_recording: Arc::new(AtomicBool::new(false)),
-            settings: Arc::new(Mutex::new(settings)),
-            hotkey_manager: Arc::new(Mutex::new(None)),
-        })
+        {
+            let mut transcriber_guard = self.transcriber.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock transcriber: {}", e))?;
+            *transcriber_guard = Some(transcriber);
+        }
+        {
+            let mut settings_guard = self.settings.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock settings: {}", e))?;
+            *settings_guard = Some(settings);
+        }
+
+        info!("AppState initialized successfully");
+        Ok(())
     }
+
+    /// Update the settings in the AppState
+    pub fn update_settings(&self, new_settings: Settings) -> anyhow::Result<()> {
+        info!("Updating AppState settings");
+        
+        // Create transcriber config from settings
+        let config = asr::TranscriberConfig {
+            model_name: new_settings.model.clone(),
+            language: new_settings.language.clone(),
+            ..Default::default()
+        };
+        
+        // Create a new transcriber
+        let transcriber = RealtimeTranscriber::new(config)?;
+
+        {
+            let mut transcriber_guard = self.transcriber.lock()
+                .map_err(|e|  anyhow::anyhow!("Failed to lock transcriber: {}", e))?;
+            *transcriber_guard = Some(transcriber);
+        }
+        {
+            let mut settings_guard = self.settings.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock settings: {}", e))?;
+            *settings_guard = Some(new_settings);
+        }
+
+        info!("Settings updated successfully in AppState");
+        Ok(())
+    }
+    
 }
 
 /// Spawn a background thread to poll for transcription updates
@@ -125,7 +169,11 @@ fn spawn_transcription_polling_thread(
                     };
                     
                     // Try to get next transcription (non-blocking)
-                    transcriber_guard.try_next_transcription().map(|result| result.text)
+                    if let Some(transcriber) = transcriber_guard.as_mut() {
+                        transcriber.try_next_transcription().map(|result| result.text)
+                    } else {
+                        None
+                    }
                 };
                 
                 // Emit transcription update if we got one
@@ -161,12 +209,15 @@ fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, S
     let mut transcriber_guard = state.transcriber.lock()
         .map_err(|e| format!("Failed to lock transcriber: {}", e))?;
     
+    let transcriber = transcriber_guard.as_mut()
+        .ok_or_else(|| "Transcriber not initialized".to_string())?;
+    
     // Stop the transcriber
-    transcriber_guard.stop();
+    transcriber.stop();
     
     // Try to get any remaining transcription results
     let mut final_text = String::new();
-    while let Some(result) = transcriber_guard.try_next_transcription() {
+    while let Some(result) = transcriber.try_next_transcription() {
         if !result.text.is_empty() {
             final_text = result.text;
         }
@@ -319,6 +370,8 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
     let (device_id, device_name) = {
         let settings = state.settings.lock()
             .map_err(|e| anyhow::anyhow!("Failed to lock settings: {}", e))?;
+        let settings = settings.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Settings not initialized"))?;
         (settings.device_id.clone(), settings.get_device_name())
     };
     
@@ -362,19 +415,22 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
 
     // Get transcriber and start it with the recorder
     debug!("Acquiring transcriber lock...");
-    let mut transcriber = state.transcriber.lock()
+    let mut transcriber_guard = state.transcriber.lock()
         .map_err(|e| {
             error!("Failed to lock transcriber: {}", e);
             anyhow::anyhow!("Failed to lock transcriber: {}", e)
         })?;
     debug!("Transcriber lock acquired");
 
+    let transcriber = transcriber_guard.as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Transcriber not initialized"))?;
+
     // Start transcriber with custom recorder
     debug!("Starting transcriber with custom recorder...");
     transcriber.start_with_recorder(recorder)?;
     debug!("Transcriber started successfully");
 
-    drop(transcriber);
+    drop(transcriber_guard);
 
     // Set recording flag
     debug!("Setting recording flag to true...");
@@ -539,8 +595,11 @@ fn greet(name: &str) -> String {
 fn get_settings(state: tauri::State<AppState>) -> Result<Settings, String> {
     info!("Getting current settings");
     
-    let settings = state.settings.lock()
-        .map_err(|e| format!("Failed to lock settings: {}", e))?
+    let settings_guard = state.settings.lock()
+        .map_err(|e| format!("Failed to lock settings: {}", e))?;
+    
+    let settings = settings_guard.as_ref()
+        .ok_or_else(|| "Settings not initialized".to_string())?
         .clone();
     
     Ok(settings)
@@ -551,12 +610,9 @@ fn get_settings(state: tauri::State<AppState>) -> Result<Settings, String> {
 fn update_settings(state: tauri::State<AppState>, settings: Settings) -> Result<(), String> {
     info!("Updating settings: {:?}", settings);
     
-    // Update settings in AppState
-    {
-        let mut state_settings = state.settings.lock()
-            .map_err(|e| format!("Failed to lock settings: {}", e))?;
-        *state_settings = settings.clone();
-    }
+    // Update settings in AppState (this recreates the transcriber)
+    state.update_settings(settings.clone())
+        .map_err(|e| format!("Failed to update settings: {}", e))?;
     
     // Save settings to config file
     settings.save()
@@ -617,21 +673,10 @@ pub fn run() {
     eprintln!("Log file location: {:?}/app.log", log_dir);
     eprintln!("You can tail the logs with: tail -f {:?}/app.log", log_dir);
 
-    // Load settings from config file
-    eprintln!("Loading settings...");
-    let settings = Settings::load().unwrap_or_else(|e| {
-        eprintln!("Failed to load settings: {}. Using defaults.", e);
-        Settings::default()
-    });
-    eprintln!("Settings loaded: model={}, language={:?}", settings.model, settings.language);
-    
-    // Initialize application state with transcriber
-    eprintln!("Initializing application state and transcriber...");
-    let app_state = AppState::with_settings(settings).unwrap_or_else(|e| {
-        eprintln!("Failed to initialize transcriber: {}. Exiting.", e);
-        std::process::exit(1);
-    });
-    eprintln!("Application state and transcriber initialized successfully");
+    // Initialize empty application state
+    eprintln!("Initializing empty application state...");
+    let app_state = AppState::new();
+    eprintln!("Empty application state created");
 
     eprintln!("Building Tauri application...");
     tauri::Builder::default()
@@ -684,6 +729,23 @@ pub fn run() {
             info!("=== UNTERWHISPER SETUP: Logging initialized ===");
             debug!("Log directory: {:?}", log_dir);
             debug!("Log file: {:?}", log_file);
+
+            // Load settings from config file
+            info!("Loading settings...");
+            let settings = Settings::load().unwrap_or_else(|e| {
+                warn!("Failed to load settings: {}. Using defaults.", e);
+                Settings::default()
+            });
+            info!("Settings loaded: model={}, language={:?}", settings.model, settings.language);
+            
+            // Initialize application state with transcriber
+            info!("Initializing transcriber with settings...");
+            let state = app.state::<AppState>();
+            state.initialize_with_settings(settings).map_err(|e| {
+                error!("Failed to initialize transcriber: {}", e);
+                e.to_string()
+            })?;
+            info!("Transcriber initialized successfully");
 
             // Configure app to not show in dock on macOS
             app.set_activation_policy(tauri::ActivationPolicy::Prohibited);

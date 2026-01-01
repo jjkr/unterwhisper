@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Essential for global hotkeys and accessibility features -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+    
+    <!-- Required for input monitoring and global hotkey detection -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    
+    <!-- Allow unsigned executable memory for Core Graphics private APIs -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    
+    <!-- Disable library validation for global-hotkey and other native libraries -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    
+    <!-- Allow JIT for Rust runtime optimizations -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    
+    <!-- Required for hardened runtime with private API usage -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+    
+    <!-- Network client access (minimal, for future updates) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    
+    <!-- Inherit entitlements (important for proper signing) -->
+    <key>com.apple.security.inherit</key>
+    <true/>
+    
+    <!-- Allow access to window server for Core Graphics private APIs -->
+    <key>com.apple.security.cs.disable-executable-page-protection</key>
+    <true/>
+    
+    <!-- Allow access to Core Graphics window management -->
+    <key>com.apple.security.temporary-exception.mach-lookup.global-name</key>
+    <array>
+        <string>com.apple.windowserver.active</string>
+        <string>com.apple.CoreGraphics.CGSConnection</string>
+    </array>
+    
+    <!-- Allow input monitoring (required for gesture simulation) -->
+    <key>com.apple.security.device.input-monitoring</key>
+    <true/>
+    
+    <!-- Allow screen recording (may be needed for window management) -->
+    <key>com.apple.security.device.screen-recording</key>
+    <true/>
+    
+    <!-- Allow access to system events -->
+    <key>com.apple.security.temporary-exception.shared-preference.read-write</key>
+    <array>
+        <string>com.apple.HIToolbox</string>
+        <string>com.apple.universalaccess</string>
+    </array>
+
+    <key>com.apple.security.app-sandbox</key>
+    <false/> <!-- You can’t sandbox if you’re calling private CGS APIs -->
+    <key>com.apple.security.accessibility</key>
+    <true/>  <!-- For AX and event injection APIs -->
+    
+</dict>
+</plist>

@@ -7,11 +7,13 @@ pub mod config;
 pub mod dsp;
 pub mod onnx;
 pub mod transcribe;
+pub mod transformer;
 pub mod whisper;
 
 pub use audio::{AudioChunk, AudioRecorder, AudioDeviceInfo, DeviceId, SAMPLE_RATE, CHANNELS};
 pub use config::WhisperConfig;
 pub use transcribe::{RealtimeTranscriber, TranscriberConfig, TranscriptionMerger, TranscriptionResult};
+pub use transformer::UnifiedTransformer;
 pub use whisper::WhisperTransformer;
 
 //    // Configure the transcriber with default settings

@@ -41,7 +41,7 @@
 
 use crate::asr::audio::{AudioChunk, AudioRecorder, SAMPLE_RATE};
 use crate::asr::dsp::{self, fft};
-use crate::asr::whisper::WhisperTransformer;
+use crate::asr::transformer::UnifiedTransformer;
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use core::f32;
@@ -133,7 +133,7 @@ pub struct RealtimeTranscriber {
     audio_stream: Option<cpal::Stream>,
 
     // Whisper model (shared across threads)
-    whisper: Arc<Mutex<WhisperTransformer>>,
+    whisper: Arc<Mutex<UnifiedTransformer>>,
 
     // PCM audio channel (raw audio chunks)
     pcm_tx: Option<Sender<AudioChunk>>,
@@ -167,7 +167,6 @@ impl RealtimeTranscriber {
     /// Create a new real-time transcriber
     pub fn new(
         config: TranscriberConfig,
-        device: candle_core::Device,
     ) -> Result<Self> {
         info!("Initializing RealtimeTranscriber with model: {}", config.model_name);
 
@@ -181,9 +180,8 @@ impl RealtimeTranscriber {
 
         // Load Whisper model once
         info!("Loading Whisper model: {}", config.model_name);
-        let whisper = WhisperTransformer::new(
+        let whisper = UnifiedTransformer::new(
             &config.model_name,
-            device,
             config.language.clone(),
         )?;
         let whisper = Arc::new(Mutex::new(whisper));
@@ -679,7 +677,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = TranscriberConfig::default();
-        assert_eq!(config.model_name, "tiny.en");
+        assert_eq!(config.model_name, "distil-large-v3.5");
     }
     
     #[test]

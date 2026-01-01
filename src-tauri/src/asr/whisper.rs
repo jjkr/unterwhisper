@@ -6,6 +6,8 @@ use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 use log::{debug, info};
 
+use crate::asr::config::WhisperConfig;
+
 enum WhisperModel {
     Normal(m::model::Whisper),
     Quantized(m::quantized_model::Whisper),
@@ -16,10 +18,11 @@ pub struct WhisperTransformer {
     tokenizer: Tokenizer,
     device: Device,
     config: Config,
+    whisper_config: WhisperConfig,
 }
 
 impl WhisperTransformer {
-    pub fn new(model_name: &str, device: Device, _language: Option<String>) -> Result<Self> {
+    pub fn new(model_name: &str, _language: Option<String>) -> Result<Self> {
         info!("Loading Whisper model: {}", model_name);
 
         // Download model files from huggingface
@@ -36,6 +39,9 @@ impl WhisperTransformer {
         // Load config and tokenizer
         let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
         let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(anyhow::Error::msg)?;
+
+        // Use metal for fast GPU inference on macos
+        let device = Device::new_metal(0)?;
 
         // Load model based on file extension
         let model = if model_file.ends_with(".gguf") {
@@ -54,16 +60,26 @@ impl WhisperTransformer {
 
         info!("Whisper model loaded successfully");
 
+        // Create WhisperConfig from Candle Config
+        let whisper_config = WhisperConfig {
+            num_mel_bins: config.num_mel_bins,
+            vocab_size: config.vocab_size,
+            max_length: config.max_target_positions,
+            num_encoder_layers: config.encoder_layers,
+            num_decoder_layers: config.decoder_layers,
+        };
+
         Ok(Self {
             model,
             tokenizer,
             device,
             config,
+            whisper_config,
         })
     }
     
-    pub fn config(&self) -> &Config {
-        &self.config
+    pub fn config(&self) -> &WhisperConfig {
+        &self.whisper_config
     }
     
     fn get_model_info(model_name: &str) -> (&'static str, &'static str, &'static str) {

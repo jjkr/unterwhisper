@@ -46,6 +46,15 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     'distil-large-v3',
     'distil-large-v3.5',
     'parakeet-tdt-0.6b-v3',
+    // ONNX models
+    'tiny-onnx',
+    'tiny.en-onnx',
+    'tiny.en-uint8-onnx',
+    'distil-small.en-onnx',
+    'distil-medium.en-onnx',
+    'distil-large-v3-onnx',
+    'distil-large-v3.5-onnx',
+    'parakeet-tdt-0.6b-v3-onnx',
   ];
 
   // Available languages (null means auto-detect)

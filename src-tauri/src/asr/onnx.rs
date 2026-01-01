@@ -16,11 +16,9 @@
 //!
 //! ```no_run
 //! use unterwhisper_lib::asr::onnx::OnnxTranscriber;
-//! use candle_core::Device;
 //!
 //! // Create a new ONNX transcriber with the tiny.en model
-//! let device = Device::Cpu;
-//! let transcriber = OnnxTranscriber::new("tiny.en", device, None)?;
+//! let transcriber = OnnxTranscriber::new("tiny.en", None)?;
 //!
 //! // Transcribe from a mel spectrogram
 //! let mel_spectrogram: Vec<f32> = vec![/* ... */];
@@ -36,7 +34,6 @@
 //! 3. **Tokenizer**: Converts tokens to text and handles special token cleanup
 
 use anyhow::{anyhow, Result};
-use candle_core::Device;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use log::info;
 use ndarray::Array3;
@@ -86,32 +83,36 @@ use crate::asr::config::WhisperConfig;
 pub fn get_onnx_model_info(model_name: &str) -> (&'static str, &'static str, &'static str, &'static str) {
     match model_name {
         // Tiny models
-        "tiny" => ("onnx-community/whisper-tiny", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "tiny.en" => ("onnx-community/whisper-tiny.en", "main", "encoder_model.onnx", "decoder_model.onnx"),
+        "tiny" => ("Xenova/whisper-tiny", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "tiny.en" => ("Xenova/whisper-tiny.en", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "tiny.en-uint8" => ("Xenova/whisper-tiny.en", "main", "onnx/encoder_model_uint8.onnx", "onnx/decoder_model_uint8.onnx"),
         
         // Base models
-        "base" => ("onnx-community/whisper-base", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "base.en" => ("onnx-community/whisper-base.en", "main", "encoder_model.onnx", "decoder_model.onnx"),
+        "base" => ("Xenova/whisper-base", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "base.en" => ("Xenova/whisper-base.en", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
         
         // Small models
-        "small" => ("onnx-community/whisper-small", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "small.en" => ("onnx-community/whisper-small.en", "main", "encoder_model.onnx", "decoder_model.onnx"),
+        "small" => ("Xenova/whisper-small", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "small.en" => ("Xenova/whisper-small.en", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
         
         // Medium models
-        "medium" => ("onnx-community/whisper-medium", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "medium.en" => ("onnx-community/whisper-medium.en", "main", "encoder_model.onnx", "decoder_model.onnx"),
+        "medium" => ("Xenova/whisper-medium", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "medium.en" => ("Xenova/whisper-medium.en", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
         
         // Large models
-        "large" => ("onnx-community/whisper-large", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "large-v2" => ("onnx-community/whisper-large-v2", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "large-v3" => ("onnx-community/whisper-large-v3", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "large-v3-turbo" => ("onnx-community/whisper-large-v3-turbo", "main", "encoder_model.onnx", "decoder_model.onnx"),
+        "large" => ("Xenova/whisper-large", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "large-v2" => ("Xenova/whisper-large-v2", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "large-v3" => ("Xenova/whisper-large-v3", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "large-v3-turbo" => ("Xenova/whisper-large-v3-turbo", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
         
         // Distil models (smaller, faster variants)
-        "distil-small.en" => ("onnx-community/distil-whisper-small.en", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "distil-medium.en" => ("onnx-community/distil-whisper-medium.en", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "distil-large-v2" => ("onnx-community/distil-whisper-large-v2", "main", "encoder_model.onnx", "decoder_model.onnx"),
-        "distil-large-v3" => ("onnx-community/distil-whisper-large-v3", "main", "encoder_model.onnx", "decoder_model.onnx"),
+        "distil-small.en" => ("distil-whisper/distil-small.en", "main", "onnx/encoder_model_quantized.onnx", "onnx/decoder_model_quantized.onnx"),
+        "distil-medium.en" => ("distil-whisper/distil-medium.en", "main", "encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "distil-large-v2" => ("distil-whisper/distil-large-v2", "main", "encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "distil-large-v3" => ("distil-whisper/distil-large-v3", "main", "encoder_model.onnx", "onnx/decoder_model.onnx"),
+
+        // Nvidia Parakeet
+        "parakeet-tdt-0.6b-v3" => ("istupakov/parakeet-tdt-0.6b-v3-onnx", "main", "onnx/encoder-model.int8.onnx", "onnx/decoder_joint-model.int8.onnx"),
         
         // Default fallback for unknown model names
         _ => ("onnx-community/whisper-large-v3-turbo", "main", "encoder_model.onnx", "decoder_model.onnx"),
@@ -144,23 +145,24 @@ pub fn get_onnx_model_info(model_name: &str) -> (&'static str, &'static str, &'s
 /// let device = Device::Cpu;
 /// let provider = get_execution_provider(&device);
 /// ```
-fn get_execution_provider(device: &Device) -> ExecutionProviderDispatch {
-    let provider = match device {
-        Device::Cpu => {
-            info!("Selected ONNX execution provider: CPUExecutionProvider");
-            ExecutionProviderDispatch::from(CPUExecutionProvider::default())
-        }
-        Device::Cuda(_) => {
-            info!("Selected ONNX execution provider: CUDAExecutionProvider");
-            ExecutionProviderDispatch::from(CUDAExecutionProvider::default())
-        }
-        Device::Metal(_) => {
-            info!("Selected ONNX execution provider: CoreMLExecutionProvider");
-            ExecutionProviderDispatch::from(CoreMLExecutionProvider::default())
-        }
-    };
+fn get_execution_provider() -> ExecutionProviderDispatch {
+    ExecutionProviderDispatch::from(CoreMLExecutionProvider::default())
+    // let provider = match device {
+    //     Device::Cpu => {
+    //         info!("Selected ONNX execution provider: CPUExecutionProvider");
+    //         ExecutionProviderDispatch::from(CPUExecutionProvider::default())
+    //     }
+    //     Device::Cuda(_) => {
+    //         info!("Selected ONNX execution provider: CUDAExecutionProvider");
+    //         ExecutionProviderDispatch::from(CUDAExecutionProvider::default())
+    //     }
+    //     Device::Metal(_) => {
+    //         info!("Selected ONNX execution provider: CoreMLExecutionProvider");
+    //         ExecutionProviderDispatch::from(CoreMLExecutionProvider::default())
+    //     }
+    // };
     
-    provider
+    // provider
 }
 
 /// ONNX-based implementation of the Whisper transcriber.
@@ -181,7 +183,6 @@ pub struct OnnxTranscriber {
     decoder_session: Session,
     tokenizer: Tokenizer,
     config: WhisperConfig,
-    device: Device,
 }
 
 impl OnnxTranscriber {
@@ -208,7 +209,6 @@ impl OnnxTranscriber {
     /// ```
     pub fn new(
         model_name: &str,
-        device: Device,
         _language: Option<String>,
     ) -> Result<Self> {
         info!("Loading ONNX Whisper model: {}", model_name);
@@ -287,14 +287,14 @@ impl OnnxTranscriber {
         
         let encoder_session = Session::builder()
             .map_err(|e| anyhow!("Failed to create session builder: {}", e))?
-            .with_execution_providers([get_execution_provider(&device)])
+            .with_execution_providers([get_execution_provider()])
             .map_err(|e| anyhow!("Failed to set execution provider: {}", e))?
             .commit_from_file(&encoder_path)
             .map_err(|e| anyhow!("Failed to load encoder model: {}", e))?;
 
         let decoder_session = Session::builder()
             .map_err(|e| anyhow!("Failed to create session builder: {}", e))?
-            .with_execution_providers([get_execution_provider(&device)])
+            .with_execution_providers([get_execution_provider()])
             .map_err(|e| anyhow!("Failed to set execution provider: {}", e))?
             .commit_from_file(&decoder_path)
             .map_err(|e| anyhow!("Failed to load decoder model: {}", e))?;
@@ -307,7 +307,6 @@ impl OnnxTranscriber {
             decoder_session,
             tokenizer,
             config,
-            device,
         })
     }
 
