@@ -46,6 +46,8 @@ impl UnifiedTransformer {
         if model_name.ends_with("-onnx") {
             // Strip the -onnx suffix and use ONNX backend
             let base_model_name = model_name.trim_end_matches("-onnx");
+            // Disable KV cache by default - only distil-whisper models support it
+            // Users can enable it by using model names like "distil-small.en"
             let onnx_transcriber = OnnxTranscriber::new(base_model_name, language)?;
             Ok(UnifiedTransformer::Onnx(onnx_transcriber))
         } else {

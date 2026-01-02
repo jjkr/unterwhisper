@@ -102,6 +102,8 @@ impl WhisperTransformer {
             "distil-medium.en" => ("distil-whisper/distil-medium.en", "main", "model.safetensors"),
             "distil-large-v3" => ("distil-whisper/distil-large-v3", "main", "model.safetensors"),
             "distil-large-v3.5" => ("distil-whisper/distil-large-v3.5", "main", "model.safetensors"),
+            "moonshine-tiny" => ("UsefulSensors/moonshine-tiny", "main", "model.safetensors"),
+            "moonshine-base" => ("UsefulSensors/moonshine-base", "main", "model.safetensors"),
             _ => ("openai/whisper-large-v3-turbo", "main", "model.safetensors"), // Default fallback
         }
     }
