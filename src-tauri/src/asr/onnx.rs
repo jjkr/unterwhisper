@@ -916,7 +916,7 @@ impl OnnxTranscriber {
         let input_ids = Array2::from_shape_vec((1, seq_len), tokens_i64)
             .map_err(|e| anyhow!("Failed to create input_ids array: {}", e))?;
         
-        let input_ids_value = Value::from_array(input_ids)
+        let input_ids_value = Value::from_array(input_ids.clone())
             .map_err(|e| anyhow!("Failed to create ONNX value from input_ids: {}", e))?;
         
         let audio_features_value = Value::from_array(audio_features.clone())
@@ -925,41 +925,47 @@ impl OnnxTranscriber {
         // Build inputs based on cache availability
         info!("Running decoder inference...");
         let outputs = if self.use_kv_cache {
-            // Create use_cache_branch input
+            // For KV cache models, we need to check if use_cache_branch input exists
+            // Try with use_cache_branch first
             let use_cache = !is_first_iteration;
             let use_cache_array = ndarray::Array1::from_vec(vec![use_cache]);
             let use_cache_value = Value::from_array(use_cache_array)
                 .map_err(|e| anyhow!("Failed to create use_cache_branch value: {}", e))?;
 
-            if is_first_iteration {
-                // First iteration: no past cache (prefill phase)
-                info!("Decoder prefill phase: processing {} tokens", tokens_to_process.len());
-                self.decoder_session
-                    .run(ort::inputs![
-                        "input_ids" => input_ids_value,
-                        "encoder_hidden_states" => audio_features_value,
-                        "use_cache_branch" => use_cache_value
-                    ])
-                    .map_err(|e| anyhow!("Decoder inference failed (prefill): {}", e))?
+            info!("Decoder with cache: processing {} tokens (first_iter: {})", tokens_to_process.len(), is_first_iteration);
+            
+            // For now, we'll extract the cache but not use it in subsequent iterations
+            // This is because dynamically building ONNX inputs is complex with the ort crate
+            // The cache extraction still provides value for future optimization
+            info!("Note: KV cache is extracted but not yet used in generation phase");
+            
+            // Try running with use_cache_branch
+            let result = self.decoder_session.run(ort::inputs![
+                "input_ids" => input_ids_value,
+                "encoder_hidden_states" => audio_features_value,
+                "use_cache_branch" => use_cache_value
+            ]);
+            
+            // Check if it succeeded or if we need fallback
+            if let Ok(outputs) = result {
+                outputs
             } else {
-                // Subsequent iterations: use past cache (generation phase)
-                info!("Decoder generation phase: processing 1 token with cache");
+                // If use_cache_branch doesn't exist, fall back to standard inputs
+                let err = result.unwrap_err();
+                info!("use_cache_branch not supported, falling back to standard decoder: {}", err);
                 
-                let _past_cache = past_kv_cache.expect("Cache should be present for non-first iteration");
-                let _num_layers = self.config.num_decoder_layers;
-                
-                // We need to build inputs dynamically, but ORT doesn't support mixed-type HashMaps easily
-                // So we'll need to use a workaround: convert everything through the session's input API
-                // For now, let's log an error and fall back to standard mode
-                info!("KV cache generation phase not yet fully implemented - falling back to full sequence processing");
+                // Need to recreate the values since they were moved
+                let input_ids_value2 = Value::from_array(input_ids)
+                    .map_err(|e| anyhow!("Failed to create ONNX value from input_ids: {}", e))?;
+                let audio_features_value2 = Value::from_array(audio_features.clone())
+                    .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
                 
                 self.decoder_session
                     .run(ort::inputs![
-                        "input_ids" => input_ids_value,
-                        "encoder_hidden_states" => audio_features_value,
-                        "use_cache_branch" => use_cache_value
+                        "input_ids" => input_ids_value2,
+                        "encoder_hidden_states" => audio_features_value2
                     ])
-                    .map_err(|e| anyhow!("Decoder inference failed (generation fallback): {}", e))?
+                    .map_err(|e| anyhow!("Decoder inference failed: {}", e))?
             }
         } else {
             // Standard decoder without cache
@@ -1001,18 +1007,26 @@ impl OnnxTranscriber {
 
         // Extract KV cache if using cache
         let new_cache = if self.use_kv_cache {
+            // First, let's log what outputs are actually available
+            info!("Available decoder outputs:");
+            for (idx, output) in outputs.iter().enumerate() {
+                info!("  Output {}: {:?}", idx, output);
+            }
+            
             let num_layers = self.config.num_decoder_layers;
-            let mut cache_values = Vec::with_capacity(num_layers * 4);
+            let mut cache_values: Vec<ndarray::ArrayD<f32>> = Vec::with_capacity(num_layers * 4);
             
             info!("Extracting KV cache for {} layers...", num_layers);
+            
+            // Extract cache for each layer
+            // Pattern: present.{layer}.decoder.key/value and present.{layer}.encoder.key/value
             for layer_idx in 0..num_layers {
-                // Extract present cache for this layer and convert to owned arrays
                 let decoder_key_name = format!("present.{}.decoder.key", layer_idx);
                 let decoder_value_name = format!("present.{}.decoder.value", layer_idx);
-                let enc_dec_key_name = format!("present.{}.encoder_decoder.key", layer_idx);
-                let enc_dec_value_name = format!("present.{}.encoder_decoder.value", layer_idx);
+                let encoder_key_name = format!("present.{}.encoder.key", layer_idx);
+                let encoder_value_name = format!("present.{}.encoder.value", layer_idx);
                 
-                // Extract each tensor and recreate as Value
+                // Extract decoder self-attention cache
                 let decoder_key = outputs[decoder_key_name.as_str()].try_extract_tensor::<f32>()?;
                 let (shape, data) = decoder_key;
                 let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
@@ -1025,20 +1039,21 @@ impl OnnxTranscriber {
                 let array = ndarray::ArrayD::from_shape_vec(dims, data.to_vec())?;
                 cache_values.push(array);
                 
-                let enc_dec_key = outputs[enc_dec_key_name.as_str()].try_extract_tensor::<f32>()?;
-                let (shape, data) = enc_dec_key;
+                // Extract encoder cross-attention cache
+                let encoder_key = outputs[encoder_key_name.as_str()].try_extract_tensor::<f32>()?;
+                let (shape, data) = encoder_key;
                 let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
                 let array = ndarray::ArrayD::from_shape_vec(dims, data.to_vec())?;
                 cache_values.push(array);
                 
-                let enc_dec_value = outputs[enc_dec_value_name.as_str()].try_extract_tensor::<f32>()?;
-                let (shape, data) = enc_dec_value;
+                let encoder_value = outputs[encoder_value_name.as_str()].try_extract_tensor::<f32>()?;
+                let (shape, data) = encoder_value;
                 let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
                 let array = ndarray::ArrayD::from_shape_vec(dims, data.to_vec())?;
                 cache_values.push(array);
             }
             
-            info!("Extracted {} cache tensors", cache_values.len());
+            info!("Successfully extracted {} cache tensors", cache_values.len());
             Some(cache_values)
         } else {
             None
