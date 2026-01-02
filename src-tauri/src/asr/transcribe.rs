@@ -302,10 +302,10 @@ impl RealtimeTranscriber {
             // }
         }
 
-        // // Only keep last 30s of mel data
+        // // Only keep last 30s of mel data (most recent frames)
         if mel_buffer_locked.len() > N_FRAMES {
             let extra_frames = mel_buffer_locked.len() - N_FRAMES;
-            mel_buffer_locked.drain(extra_frames..);
+            mel_buffer_locked.drain(0..extra_frames);
         }
 
         Ok(())
@@ -457,7 +457,11 @@ impl RealtimeTranscriber {
                     let mel_data: Vec<f32> = {
                         let buffer = mel_buffer.lock().expect("Mel buffer lock poisoned");
 
-                        if buffer.is_empty() {
+                        // Wait until we have at least 1 second of audio (100 frames at 10ms hop)
+                        // This prevents transcribing mostly-empty buffers
+                        const MIN_FRAMES_FOR_TRANSCRIPTION: usize = 100;
+                        
+                        if buffer.len() < MIN_FRAMES_FOR_TRANSCRIPTION {
                             Vec::new()
                         } else {
                             let n_frames = buffer.len().min(N_FRAMES);
@@ -485,10 +489,11 @@ impl RealtimeTranscriber {
                         }
                     };
 
-                    debug!("MEL data size: {} frames", mel_data.len() / 3000);
+                    debug!("MEL buffer has {} frames, data size: {} elements", 
+                           mel_buffer.lock().unwrap().len(), mel_data.len());
                     if mel_data.len() == 0 {
-                        debug!("Sleeping for 20ms");
-                        thread::sleep(Duration::from_millis(20));
+                        debug!("Waiting for more audio data (need at least 1 second)");
+                        thread::sleep(Duration::from_millis(100));
                         continue;
                     }
 

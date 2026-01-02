@@ -35,15 +35,34 @@
 
 use anyhow::{anyhow, Result};
 use hf_hub::{api::sync::Api, Repo, RepoType};
-use log::info;
+use log::{debug, info};
 use ndarray::Array3;
 use ort::execution_providers::{
-    CPUExecutionProvider, CUDAExecutionProvider, CoreMLExecutionProvider, ExecutionProviderDispatch,
+    CoreMLExecutionProvider, ExecutionProviderDispatch,
 };
 use ort::session::Session;
 use tokenizers::Tokenizer;
 
 use crate::asr::config::WhisperConfig;
+
+/// Decoder variant to use for inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderVariant {
+    /// Standard decoder without KV caching (slower but simpler)
+    Standard,
+    /// Merged decoder with KV caching support (faster, recommended)
+    Merged,
+}
+
+impl DecoderVariant {
+    /// Returns the filename for this decoder variant.
+    pub fn filename(&self) -> &'static str {
+        match self {
+            DecoderVariant::Standard => "decoder_model.onnx",
+            DecoderVariant::Merged => "decoder_model_merged.onnx",
+        }
+    }
+}
 
 /// Maps a Whisper model name to its HuggingFace repository information.
 ///
@@ -80,46 +99,42 @@ use crate::asr::config::WhisperConfig;
 /// - Supports all standard Whisper variants: tiny, base, small, medium, large
 /// - Supports English-only variants with ".en" suffix
 /// - Supports distil variants for smaller, faster models
-pub fn get_onnx_model_info(model_name: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+pub fn get_onnx_model_info(model_name: &str) -> (&'static str, &'static str, &'static str) {
     match model_name {
         // Tiny models
-        "tiny" => ("Xenova/whisper-tiny", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-        "tiny.en" => ("Xenova/whisper-tiny.en", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-        "tiny.en-uint8" => ("Xenova/whisper-tiny.en", "main", "onnx/encoder_model_uint8.onnx", "onnx/decoder_model_uint8.onnx"),
-
+        "tiny" => ("Xenova/whisper-tiny", "main", "onnx/encoder_model.onnx"),
+        "tiny.en" => ("Xenova/whisper-tiny.en", "main", "onnx/encoder_model.onnx"),
+        "tiny.en-uint8" => ("Xenova/whisper-tiny.en", "main", "onnx/encoder_model_uint8.onnx"),
+        
         // Base models
-        "base" => ("Xenova/whisper-base", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-        "base.en" => ("Xenova/whisper-base.en", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-
+        "base" => ("Xenova/whisper-base", "main", "onnx/encoder_model.onnx"),
+        "base.en" => ("Xenova/whisper-base.en", "main", "onnx/encoder_model.onnx"),
+        
         // Small models
-        "small" => ("Xenova/whisper-small", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-        "small.en" => ("Xenova/whisper-small.en", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-
+        "small" => ("Xenova/whisper-small", "main", "onnx/encoder_model.onnx"),
+        "small.en" => ("Xenova/whisper-small.en", "main", "onnx/encoder_model.onnx"),
+        
         // Medium models
-        "medium" => ("Xenova/whisper-medium", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-        "medium.en" => ("Xenova/whisper-medium.en", "main", "onnx/encoder_model_fp16.onnx", "onnx/decoder_model_fp16.onnx"),
-        "medium.en-uint8" => ("Xenova/whisper-medium.en", "main", "onnx/encoder_model_uint8.onnx", "onnx/decoder_model_uint8.onnx"),
-
+        "medium" => ("Xenova/whisper-medium", "main", "onnx/encoder_model.onnx"),
+        "medium.en" => ("Xenova/whisper-medium.en", "main", "onnx/encoder_model.onnx"),
+        
         // Large models
-        "large" => ("Xenova/whisper-large", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
-        "large-v2" => ("Xenova/whisper-large-v2", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
-        "large-v3" => ("Xenova/whisper-large-v3", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
-        "large-v3-turbo" => ("Xenova/whisper-large-v3-turbo", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "large" => ("Xenova/whisper-large", "main", "onnx/encoder_model.onnx"),
+        "large-v2" => ("Xenova/whisper-large-v2", "main", "onnx/encoder_model.onnx"),
+        "large-v3" => ("Xenova/whisper-large-v3", "main", "onnx/encoder_model.onnx"),
+        "large-v3-turbo" => ("Xenova/whisper-large-v3-turbo", "main", "onnx/encoder_model.onnx"),
         
         // Distil models (smaller, faster variants)
-        "distil-small.en" => ("distil-whisper/distil-small.en", "main", "onnx/encoder_model.onnx", "onnx/decoder_model_merged.onnx"),
-        "distil-small.en-merged-quantized" => ("distil-whisper/distil-merged-small.en", "main", "onnx/encoder_model_quantized.onnx", "onnx/decoder_model_merged_quantized.onnx"),
-        "distil-small.en-quantized" => ("distil-whisper/distil-small.en", "main", "onnx/encoder_model_quantized.onnx", "onnx/decoder_model_merged_quantized.onnx"),
-        "distil-medium.en" => ("distil-whisper/distil-medium.en", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
-        "distil-medium.en-quantized" => ("distil-whisper/distil-medium.en", "main", "onnx/encoder_model_quantized.onnx", "onnx/decoder_model_quantized.onnx"),
-        "distil-large-v2" => ("distil-whisper/distil-large-v2", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
-        "distil-large-v3" => ("distil-whisper/distil-large-v3", "main", "onnx/encoder_model.onnx", "onnx/decoder_model.onnx"),
+        "distil-small.en" => ("distil-whisper/distil-small.en", "main", "onnx/encoder_model_quantized.onnx"),
+        "distil-medium.en" => ("distil-whisper/distil-medium.en", "main", "encoder_model.onnx"),
+        "distil-large-v2" => ("distil-whisper/distil-large-v2", "main", "encoder_model.onnx"),
+        "distil-large-v3" => ("distil-whisper/distil-large-v3", "main", "encoder_model.onnx"),
 
         // Nvidia Parakeet
-        "parakeet-tdt-0.6b-v3" => ("istupakov/parakeet-tdt-0.6b-v3-onnx", "main", "onnx/encoder-model.int8.onnx", "onnx/decoder_joint-model.int8.onnx"),
+        "parakeet-tdt-0.6b-v3" => ("istupakov/parakeet-tdt-0.6b-v3-onnx", "main", "onnx/encoder-model.int8.onnx"),
         
         // Default fallback for unknown model names
-        _ => ("onnx-community/whisper-large-v3-turbo", "main", "encoder_model.onnx", "decoder_model.onnx"),
+        _ => ("onnx-community/whisper-large-v3-turbo", "main", "encoder_model.onnx"),
     }
 }
 
@@ -150,11 +165,7 @@ pub fn get_onnx_model_info(model_name: &str) -> (&'static str, &'static str, &'s
 /// let provider = get_execution_provider(&device);
 /// ```
 fn get_execution_provider() -> ExecutionProviderDispatch {
-    ExecutionProviderDispatch::from(CoreMLExecutionProvider::default()
-        .with_subgraphs(true)
-        .build()
-        .error_on_failure()
-    )
+    ExecutionProviderDispatch::from(CoreMLExecutionProvider::default())
     // let provider = match device {
     //     Device::Cpu => {
     //         info!("Selected ONNX execution provider: CPUExecutionProvider");
@@ -185,12 +196,15 @@ fn get_execution_provider() -> ExecutionProviderDispatch {
 /// * `decoder_session` - ONNX Runtime session for the decoder model
 /// * `tokenizer` - Tokenizers library instance for encoding/decoding text
 /// * `config` - Whisper model configuration (num_mel_bins, vocab_size, etc.)
-/// * `device` - Device specification (CPU, Metal, CUDA) for execution provider selection
+/// * `decoder_variant` - Which decoder variant is being used (standard or merged with KV cache)
+/// * `num_decoder_layers` - Number of decoder layers (needed for KV cache initialization)
 pub struct OnnxTranscriber {
     encoder_session: Session,
     decoder_session: Session,
     tokenizer: Tokenizer,
     config: WhisperConfig,
+    decoder_variant: DecoderVariant,
+    num_decoder_layers: usize,
 }
 
 impl OnnxTranscriber {
@@ -199,8 +213,8 @@ impl OnnxTranscriber {
     /// # Arguments
     ///
     /// * `model_name` - Name of the Whisper model (e.g., "tiny", "base", "small")
-    /// * `device` - Device to use for inference (CPU, CUDA, Metal)
     /// * `language` - Optional language code for transcription (e.g., Some("en"))
+    /// * `use_kv_cache` - Whether to use KV caching (merged decoder) for faster inference
     ///
     /// # Returns
     ///
@@ -211,19 +225,32 @@ impl OnnxTranscriber {
     ///
     /// ```no_run
     /// use unterwhisper_lib::asr::onnx::OnnxTranscriber;
-    /// use candle_core::Device;
     ///
-    /// let transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// // With KV caching (faster, recommended)
+    /// let transcriber = OnnxTranscriber::new("tiny.en", None, true)?;
+    ///
+    /// // Without KV caching (simpler, slower)
+    /// let transcriber = OnnxTranscriber::new("tiny.en", None, false)?;
     /// ```
     pub fn new(
         model_name: &str,
         _language: Option<String>,
+        use_kv_cache: bool,
     ) -> Result<Self> {
-        info!("Loading ONNX Whisper model: {}", model_name);
+        info!("Loading ONNX Whisper model: {} (KV cache: {})", model_name, use_kv_cache);
+
+        // Determine decoder variant
+        let decoder_variant = if use_kv_cache {
+            DecoderVariant::Merged
+        } else {
+            DecoderVariant::Standard
+        };
 
         // Get model repository information
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info(model_name);
+        let (repo_id, revision, encoder_file) = get_onnx_model_info(model_name);
+        let decoder_file = format!("onnx/{}", decoder_variant.filename());
         info!("Repository: {} (revision: {})", repo_id, revision);
+        info!("Decoder variant: {:?} ({})", decoder_variant, decoder_file);
 
         // Download model files from HuggingFace
         let api = Api::new()
@@ -243,8 +270,25 @@ impl OnnxTranscriber {
             .map_err(|e| anyhow!("Failed to download tokenizer.json: {}", e))?;
         let encoder_path = repo.get(encoder_file)
             .map_err(|e| anyhow!("Failed to download {}: {}", encoder_file, e))?;
-        let decoder_path = repo.get(decoder_file)
-            .map_err(|e| anyhow!("Failed to download {}: {}", decoder_file, e))?;
+        
+        // Try to download the requested decoder variant, fall back to standard if merged not available
+        let (decoder_path, actual_decoder_variant) = match repo.get(&decoder_file) {
+            Ok(path) => {
+                info!("Successfully downloaded {} decoder", decoder_variant.filename());
+                (path, decoder_variant)
+            }
+            Err(e) => {
+                if decoder_variant == DecoderVariant::Merged {
+                    info!("Merged decoder not available ({}), falling back to standard decoder", e);
+                    let fallback_file = format!("onnx/{}", DecoderVariant::Standard.filename());
+                    let path = repo.get(&fallback_file)
+                        .map_err(|e2| anyhow!("Failed to download fallback decoder {}: {}", fallback_file, e2))?;
+                    (path, DecoderVariant::Standard)
+                } else {
+                    return Err(anyhow!("Failed to download {}: {}", decoder_file, e));
+                }
+            }
+        };
 
         info!("Model files downloaded successfully");
 
@@ -308,11 +352,6 @@ impl OnnxTranscriber {
             .map_err(|e| anyhow!("Failed to load decoder model: {}", e))?;
 
         info!("ONNX sessions created successfully");
-        
-        // Log execution provider information
-        info!("Encoder execution providers: {:?}", encoder_session.inputs);
-        info!("Decoder execution providers: {:?}", decoder_session.inputs);
-        
         info!("ONNX Whisper model loaded successfully");
 
         Ok(Self {
@@ -320,6 +359,8 @@ impl OnnxTranscriber {
             decoder_session,
             tokenizer,
             config,
+            decoder_variant: actual_decoder_variant,
+            num_decoder_layers,
         })
     }
 
@@ -376,35 +417,23 @@ impl OnnxTranscriber {
     /// println!("Transcription: {}", text);
     /// ```
     pub fn transcribe_from_mel(&mut self, mel_spectrogram: &[f32]) -> Result<String> {
-        info!("Starting transcription from mel spectrogram (length: {})", mel_spectrogram.len());
-        
         // Step 1: Preprocess mel spectrogram
-        info!("Step 1: Preprocessing mel spectrogram...");
         let mel_tensor = match self.preprocess_mel(mel_spectrogram) {
-            Some(tensor) => {
-                info!("Mel tensor preprocessed: shape {:?}", tensor.shape());
-                tensor
-            }
+            Some(tensor) => tensor,
             None => {
-                info!("Empty mel spectrogram, returning empty string");
+                // Empty input returns empty string
                 return Ok(String::new());
             }
         };
 
         // Step 2: Run encoder to get audio features
-        info!("Step 2: Running encoder...");
         let audio_features = self.run_encoder(&mel_tensor)?;
-        info!("Encoder completed: audio features shape {:?}", audio_features.shape());
 
         // Step 3: Generate tokens with decoder
-        info!("Step 3: Generating tokens with decoder...");
         let tokens = self.generate_tokens(&audio_features)?;
-        info!("Token generation completed: {} tokens generated", tokens.len());
 
         // Step 4: Decode and clean text
-        info!("Step 4: Decoding tokens to text...");
         let text = self.decode_and_clean(&tokens)?;
-        info!("Transcription completed: {} characters", text.len());
 
         Ok(text)
     }
@@ -507,17 +536,17 @@ impl OnnxTranscriber {
     fn run_encoder(&mut self, mel_tensor: &Array3<f32>) -> Result<Array3<f32>> {
         use ort::value::Value;
 
-        info!("Creating ONNX value from mel tensor...");
+        // Create ONNX value from the mel tensor
         let mel_value = Value::from_array(mel_tensor.clone())
             .map_err(|e| anyhow!("Failed to create ONNX value from mel tensor: {}", e))?;
 
-        info!("Running encoder inference...");
+        // Run encoder session with the mel spectrogram input
         let outputs = self.encoder_session
             .run(ort::inputs!["input_features" => mel_value])
             .map_err(|e| anyhow!("Encoder inference failed: {}", e))?;
-        info!("Encoder inference completed");
 
-        info!("Extracting audio features from encoder output...");
+        // Extract the audio features from the output
+        // The encoder output is typically named "last_hidden_state" in Whisper ONNX models
         let audio_features = outputs["last_hidden_state"]
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("Failed to extract audio features from encoder output: {}", e))?;
@@ -622,13 +651,19 @@ impl OnnxTranscriber {
     fn initialize_tokens(&self) -> Result<Vec<u32>> {
         // Get special token IDs
         let sot_token = self.get_token_id("<|startoftranscript|>")?;
+        info!("SOT token: {}", sot_token);
+        
         let transcribe_token = self.get_token_id("<|transcribe|>")?;
+        info!("Transcribe token: {}", transcribe_token);
+        
         let notimestamps_token = self.get_token_id("<|notimestamps|>")?;
+        info!("No timestamps token: {}", notimestamps_token);
         
         // Get language token - default to English
         // For English-only models, this will be <|en|>
         // For multilingual models, we could detect language, but default to English for now
         let language_token = self.get_token_id("<|en|>")?;
+        info!("Language token: {}", language_token);
         
         // Build initial token sequence: [SOT, LANG, TRANSCRIBE, NO_TIMESTAMPS]
         let tokens = vec![
@@ -637,6 +672,8 @@ impl OnnxTranscriber {
             transcribe_token,
             notimestamps_token,
         ];
+        
+        info!("Initialized token sequence: {:?}", tokens);
         
         Ok(tokens)
     }
@@ -788,6 +825,16 @@ impl OnnxTranscriber {
                 .map(|(idx, _)| idx)
                 .ok_or_else(|| anyhow!("Failed to find maximum logit"))?;
             
+            debug!("Greedy selection: token {} with logit {:.4}", max_idx, last_logits_vec[max_idx]);
+            
+            // Log top 5 tokens for debugging
+            let mut top_tokens: Vec<(usize, f32)> = last_logits_vec.iter()
+                .enumerate()
+                .map(|(i, &v)| (i, v))
+                .collect();
+            top_tokens.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            debug!("Top 5 tokens: {:?}", &top_tokens[..5.min(top_tokens.len())]);
+            
             Ok(max_idx as u32)
         } else {
             // Sampling with temperature
@@ -842,11 +889,13 @@ impl OnnxTranscriber {
     ///
     /// * `input_tokens` - Current token sequence as a slice of u32 values
     /// * `audio_features` - Audio features from the encoder, shape `(1, sequence_length, hidden_size)`
+    /// * `past_key_values` - Optional KV cache from previous decoder runs (for merged decoder only)
     ///
     /// # Returns
     ///
-    /// Returns a `Result` containing the logits as an `Array3<f32>` with shape
-    /// `(1, sequence_length, vocab_size)`, or an error if inference fails.
+    /// Returns a `Result` containing a tuple of:
+    /// * `logits` - The logits as an `Array3<f32>` with shape `(1, sequence_length, vocab_size)`
+    /// * `new_past_key_values` - Updated KV cache (for merged decoder only)
     ///
     /// # Errors
     ///
@@ -859,29 +908,38 @@ impl OnnxTranscriber {
     ///
     /// ```no_run
     /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
-    /// # use candle_core::Device;
     /// # use ndarray::Array3;
-    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", None, true)?;
     /// let tokens = vec![50258, 50259, 50359, 50363];
     /// let audio_features = Array3::<f32>::zeros((1, 1500, 384));
-    /// let logits = transcriber.run_decoder(&tokens, &audio_features)?;
+    /// let (logits, kv_cache) = transcriber.run_decoder(&tokens, &audio_features, None)?;
     /// ```
     fn run_decoder(
         &mut self,
         input_tokens: &[u32],
         audio_features: &Array3<f32>,
-    ) -> Result<Array3<f32>> {
+        past_key_values: Option<Vec<ort::value::Value>>,
+    ) -> Result<(Array3<f32>, Option<Vec<ort::value::Value>>)> {
         use ndarray::Array2;
         use ort::value::Value;
 
-        info!("Preparing decoder inputs (token count: {})...", input_tokens.len());
-        
         // Convert tokens to i64 array (ONNX typically uses int64 for token IDs)
         let tokens_i64: Vec<i64> = input_tokens.iter().map(|&t| t as i64).collect();
-        let seq_len = tokens_i64.len();
+        
+        // For merged decoder with KV cache, only use the last token after the first iteration
+        let (input_ids_vec, seq_len) = if self.decoder_variant == DecoderVariant::Merged && past_key_values.is_some() {
+            // Only use the last token when we have past KV cache
+            (vec![*tokens_i64.last().unwrap()], 1)
+        } else {
+            // Use all tokens for first iteration or standard decoder
+            (tokens_i64, input_tokens.len())
+        };
+        
+        debug!("Running decoder with {} tokens (total sequence: {}), audio features shape: {:?}", 
+               seq_len, input_tokens.len(), audio_features.shape());
         
         // Create input_ids tensor: shape (batch_size, sequence_length)
-        let input_ids = Array2::from_shape_vec((1, seq_len), tokens_i64)
+        let input_ids = Array2::from_shape_vec((1, seq_len), input_ids_vec)
             .map_err(|e| anyhow!("Failed to create input_ids array: {}", e))?;
         
         let input_ids_value = Value::from_array(input_ids)
@@ -890,16 +948,54 @@ impl OnnxTranscriber {
         let audio_features_value = Value::from_array(audio_features.clone())
             .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
 
-        info!("Running decoder inference...");
-        let outputs = self.decoder_session
-            .run(ort::inputs![
+        // Log input/output names for debugging (only on first call)
+        if past_key_values.is_none() {
+            let input_names: Vec<String> = self.decoder_session.inputs.iter().map(|i| i.name.clone()).collect();
+            debug!("Decoder input names: {:?}", input_names);
+            
+            let output_names: Vec<String> = self.decoder_session.outputs.iter().map(|o| o.name.clone()).collect();
+            debug!("Decoder output names: {:?}", output_names);
+        }
+
+        // Run decoder session with appropriate inputs based on variant
+        let outputs = if self.decoder_variant == DecoderVariant::Merged {
+            // Merged decoder with KV caching
+            if let Some(past_kv) = past_key_values {
+                // Subsequent iterations: use past key values
+                let mut inputs_vec = vec![
+                    ("input_ids", input_ids_value),
+                    ("encoder_hidden_states", audio_features_value),
+                    ("use_cache_branch", ort::value::Value::from_array(ndarray::arr0(true))
+                        .map_err(|e| anyhow!("Failed to create use_cache_branch value: {}", e))?),
+                ];
+                
+                // Add past key values to inputs
+                for (i, kv_value) in past_kv.into_iter().enumerate() {
+                    inputs_vec.push((format!("past_key_values.{}.key", i / 2).leak(), kv_value));
+                }
+                
+                self.decoder_session.run(ort::inputs(inputs_vec)?)
+                    .map_err(|e| anyhow!("Decoder inference failed (with cache): {}", e))?
+            } else {
+                // First iteration: no past key values
+                self.decoder_session.run(ort::inputs![
+                    "input_ids" => input_ids_value,
+                    "encoder_hidden_states" => audio_features_value,
+                    "use_cache_branch" => ort::value::Value::from_array(ndarray::arr0(false))
+                        .map_err(|e| anyhow!("Failed to create use_cache_branch value: {}", e))?,
+                ]?)
+                .map_err(|e| anyhow!("Decoder inference failed (first iteration): {}", e))?
+            }
+        } else {
+            // Standard decoder without KV caching
+            self.decoder_session.run(ort::inputs![
                 "input_ids" => input_ids_value,
                 "encoder_hidden_states" => audio_features_value
-            ])
-            .map_err(|e| anyhow!("Decoder inference failed: {}", e))?;
-        info!("Decoder inference completed");
+            ]?)
+            .map_err(|e| anyhow!("Decoder inference failed: {}", e))?
+        };
 
-        info!("Extracting logits from decoder output...");
+        // Extract logits from the output
         let logits = outputs["logits"]
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("Failed to extract logits from decoder output: {}", e))?;
@@ -917,6 +1013,8 @@ impl OnnxTranscriber {
         let dim0 = dims[0] as usize;
         let dim1 = dims[1] as usize;
         let dim2 = dims[2] as usize;
+        
+        debug!("Decoder output logits shape: ({}, {}, {})", dim0, dim1, dim2);
 
         // Create Array3 from the data
         let logits_array = Array3::from_shape_vec(
@@ -924,7 +1022,40 @@ impl OnnxTranscriber {
             data.to_vec()
         ).map_err(|e| anyhow!("Failed to create logits array: {}", e))?;
 
-        Ok(logits_array)
+        // Extract new past key values if using merged decoder
+        let new_past_key_values = if self.decoder_variant == DecoderVariant::Merged {
+            let mut new_kv = Vec::new();
+            
+            // Extract present key values from outputs
+            // The merged decoder outputs present.{layer}.decoder.key and present.{layer}.decoder.value
+            for layer_idx in 0..self.num_decoder_layers {
+                // Try to extract key
+                let key_name = format!("present.{}.decoder.key", layer_idx);
+                if let Some(key_value) = outputs.get(&key_name) {
+                    new_kv.push(key_value.clone());
+                } else {
+                    debug!("Warning: Could not find {} in decoder outputs", key_name);
+                }
+                
+                // Try to extract value
+                let value_name = format!("present.{}.decoder.value", layer_idx);
+                if let Some(value_value) = outputs.get(&value_name) {
+                    new_kv.push(value_value.clone());
+                } else {
+                    debug!("Warning: Could not find {} in decoder outputs", value_name);
+                }
+            }
+            
+            if !new_kv.is_empty() {
+                Some(new_kv)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok((logits_array, new_past_key_values))
     }
 
     /// Generates a sequence of tokens from audio features.
@@ -933,6 +1064,9 @@ impl OnnxTranscriber {
     /// Whisper decoder. It starts with an initial token sequence (including special
     /// tokens), then iteratively runs the decoder to predict the next token until
     /// either the end-of-text token is generated or the maximum length is reached.
+    ///
+    /// When using the merged decoder variant with KV caching, this method maintains
+    /// and reuses past key-value states for significantly faster inference.
     ///
     /// # Arguments
     ///
@@ -947,9 +1081,10 @@ impl OnnxTranscriber {
     ///
     /// 1. Initialize token sequence with special tokens (SOT, LANG, TRANSCRIBE, NO_TIMESTAMPS)
     /// 2. Loop until stopping condition:
-    ///    - Run decoder with current tokens and audio features
+    ///    - Run decoder with current tokens and audio features (and KV cache if available)
     ///    - Sample next token from logits (using greedy decoding by default)
     ///    - Append token to sequence
+    ///    - Update KV cache for next iteration (merged decoder only)
     ///    - Check for end-of-text token or max length
     /// 3. Return complete token sequence
     ///
@@ -963,21 +1098,20 @@ impl OnnxTranscriber {
     ///
     /// ```no_run
     /// # use unterwhisper_lib::asr::onnx::OnnxTranscriber;
-    /// # use candle_core::Device;
     /// # use ndarray::Array3;
-    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", Device::Cpu, None)?;
+    /// # let mut transcriber = OnnxTranscriber::new("tiny.en", None, true)?;
     /// let audio_features = Array3::<f32>::zeros((1, 1500, 384));
     /// let tokens = transcriber.generate_tokens(&audio_features)?;
     /// println!("Generated {} tokens", tokens.len());
     /// ```
     fn generate_tokens(&mut self, audio_features: &Array3<f32>) -> Result<Vec<u32>> {
-        info!("Initializing token sequence...");
+        // Initialize token sequence with special tokens
         let mut tokens = self.initialize_tokens()?;
         info!("Initial tokens: {:?}", tokens);
         
         // Get end-of-text token ID
         let eot_token = self.get_token_id("<|endoftext|>")?;
-        info!("End-of-text token ID: {}", eot_token);
+        info!("EOT token ID: {}", eot_token);
         
         // Get maximum length from config
         let max_length = self.config.max_length;
@@ -985,39 +1119,42 @@ impl OnnxTranscriber {
         // Temperature for sampling (0.0 = greedy decoding)
         let temperature = 0.0;
         
-        info!("Starting autoregressive token generation (max_length: {})...", max_length);
-        let mut iteration = 0;
+        // KV cache for merged decoder
+        let mut past_key_values: Option<Vec<ort::value::Value>> = None;
         
         // Generate tokens until EOT or max_length
+        let mut iteration = 0;
         loop {
-            iteration += 1;
-            
             // Check if we've reached max length
             if tokens.len() >= max_length {
-                info!("Reached max length ({}) after {} iterations", max_length, iteration);
+                info!("Reached max length: {}", max_length);
                 break;
             }
             
-            // Run decoder with current tokens and audio features
-            info!("Iteration {}: Running decoder with {} tokens...", iteration, tokens.len());
-            let logits = self.run_decoder(&tokens, audio_features)?;
+            // Run decoder with current tokens, audio features, and KV cache
+            let (logits, new_kv_cache) = self.run_decoder(&tokens, audio_features, past_key_values)?;
+            
+            // Update KV cache for next iteration
+            past_key_values = new_kv_cache;
             
             // Sample next token
-            info!("Iteration {}: Sampling next token...", iteration);
             let next_token = self.sample_token(&logits, &tokens, temperature)?;
-            info!("Iteration {}: Sampled token {}", iteration, next_token);
+            debug!("Iteration {}: Generated token {}", iteration, next_token);
             
             // Append token to sequence
             tokens.push(next_token);
             
             // Check for end-of-text token
             if next_token == eot_token {
-                info!("End-of-text token generated after {} iterations", iteration);
+                info!("Generated EOT token after {} iterations", iteration);
                 break;
             }
+            
+            iteration += 1;
         }
         
-        info!("Token generation completed: {} total tokens after {} iterations", tokens.len(), iteration);
+        info!("Token generation complete. Total tokens: {}", tokens.len());
+        
         Ok(tokens)
     }
 
@@ -1064,11 +1201,15 @@ impl OnnxTranscriber {
     /// println!("Transcription: {}", text);
     /// ```
     fn decode_and_clean(&self, tokens: &[u32]) -> Result<String> {
+        info!("Decoding {} tokens: {:?}", tokens.len(), tokens);
+        
         // Decode tokens to text using the tokenizer
         // skip_special_tokens=false because we want to manually remove specific ones
         let text = self.tokenizer
             .decode(tokens, false)
             .map_err(|e| anyhow!("Tokenizer decode failed: {}", e))?;
+        
+        info!("Raw decoded text: '{}'", text);
         
         // Remove special tokens
         let cleaned = text
@@ -1080,6 +1221,8 @@ impl OnnxTranscriber {
             .trim()
             .to_string();
         
+        info!("Cleaned text: '{}'", cleaned);
+        
         Ok(cleaned)
     }
 }
@@ -1090,132 +1233,114 @@ mod tests {
 
     #[test]
     fn test_get_onnx_model_info_tiny_models() {
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("tiny");
-        assert_eq!(repo_id, "onnx-community/whisper-tiny");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("tiny");
+        assert_eq!(repo_id, "Xenova/whisper-tiny");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("tiny.en");
-        assert_eq!(repo_id, "onnx-community/whisper-tiny.en");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("tiny.en");
+        assert_eq!(repo_id, "Xenova/whisper-tiny.en");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
     }
 
     #[test]
     fn test_get_onnx_model_info_base_models() {
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("base");
-        assert_eq!(repo_id, "onnx-community/whisper-base");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("base");
+        assert_eq!(repo_id, "Xenova/whisper-base");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("base.en");
-        assert_eq!(repo_id, "onnx-community/whisper-base.en");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("base.en");
+        assert_eq!(repo_id, "Xenova/whisper-base.en");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
     }
 
     #[test]
     fn test_get_onnx_model_info_small_models() {
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("small");
-        assert_eq!(repo_id, "onnx-community/whisper-small");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("small");
+        assert_eq!(repo_id, "Xenova/whisper-small");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("small.en");
-        assert_eq!(repo_id, "onnx-community/whisper-small.en");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("small.en");
+        assert_eq!(repo_id, "Xenova/whisper-small.en");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
     }
 
     #[test]
     fn test_get_onnx_model_info_medium_models() {
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("medium");
-        assert_eq!(repo_id, "onnx-community/whisper-medium");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("medium");
+        assert_eq!(repo_id, "Xenova/whisper-medium");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("medium.en");
-        assert_eq!(repo_id, "onnx-community/whisper-medium.en");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("medium.en");
+        assert_eq!(repo_id, "Xenova/whisper-medium.en");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
     }
 
     #[test]
     fn test_get_onnx_model_info_large_models() {
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("large");
-        assert_eq!(repo_id, "onnx-community/whisper-large");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("large");
+        assert_eq!(repo_id, "Xenova/whisper-large");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("large-v2");
-        assert_eq!(repo_id, "onnx-community/whisper-large-v2");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("large-v2");
+        assert_eq!(repo_id, "Xenova/whisper-large-v2");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("large-v3");
-        assert_eq!(repo_id, "onnx-community/whisper-large-v3");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("large-v3");
+        assert_eq!(repo_id, "Xenova/whisper-large-v3");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("large-v3-turbo");
-        assert_eq!(repo_id, "onnx-community/whisper-large-v3-turbo");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("large-v3-turbo");
+        assert_eq!(repo_id, "Xenova/whisper-large-v3-turbo");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model.onnx");
     }
 
     #[test]
     fn test_get_onnx_model_info_distil_models() {
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("distil-small.en");
-        assert_eq!(repo_id, "onnx-community/distil-whisper-small.en");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("distil-small.en");
+        assert_eq!(repo_id, "distil-whisper/distil-small.en");
         assert_eq!(revision, "main");
-        assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
+        assert_eq!(encoder_file, "onnx/encoder_model_quantized.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("distil-medium.en");
-        assert_eq!(repo_id, "onnx-community/distil-whisper-medium.en");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("distil-medium.en");
+        assert_eq!(repo_id, "distil-whisper/distil-medium.en");
         assert_eq!(revision, "main");
         assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("distil-large-v2");
-        assert_eq!(repo_id, "onnx-community/distil-whisper-large-v2");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("distil-large-v2");
+        assert_eq!(repo_id, "distil-whisper/distil-large-v2");
         assert_eq!(revision, "main");
         assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("distil-large-v3");
-        assert_eq!(repo_id, "onnx-community/distil-whisper-large-v3");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("distil-large-v3");
+        assert_eq!(repo_id, "distil-whisper/distil-large-v3");
         assert_eq!(revision, "main");
         assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
     }
 
     #[test]
     fn test_get_onnx_model_info_unknown_model_fallback() {
         // Test that unknown model names fall back to large-v3-turbo
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("unknown-model");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("unknown-model");
         assert_eq!(repo_id, "onnx-community/whisper-large-v3-turbo");
         assert_eq!(revision, "main");
         assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
 
-        let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info("some-random-name");
+        let (repo_id, revision, encoder_file) = get_onnx_model_info("some-random-name");
         assert_eq!(repo_id, "onnx-community/whisper-large-v3-turbo");
         assert_eq!(revision, "main");
         assert_eq!(encoder_file, "encoder_model.onnx");
-        assert_eq!(decoder_file, "decoder_model.onnx");
     }
 
     #[test]
@@ -1228,7 +1353,7 @@ mod tests {
         ];
 
         for model in models {
-            let (repo_id, revision, encoder_file, decoder_file) = get_onnx_model_info(model);
+            let (repo_id, revision, encoder_file) = get_onnx_model_info(model);
             
             // Verify repo_id is not empty and contains a slash (org/repo format)
             assert!(!repo_id.is_empty(), "repo_id should not be empty for model: {}", model);
@@ -1237,35 +1362,22 @@ mod tests {
             // Verify revision is "main"
             assert_eq!(revision, "main", "revision should be 'main' for model: {}", model);
             
-            // Verify encoder_file is encoder_model.onnx
-            assert_eq!(encoder_file, "encoder_model.onnx", "encoder_file should be 'encoder_model.onnx' for model: {}", model);
-            
-            // Verify decoder_file is decoder_model.onnx
-            assert_eq!(decoder_file, "decoder_model.onnx", "decoder_file should be 'decoder_model.onnx' for model: {}", model);
+            // Verify encoder_file ends with .onnx
+            assert!(encoder_file.ends_with(".onnx"), "encoder_file should end with '.onnx' for model: {}", model);
         }
     }
 
     #[test]
-    fn test_preprocess_mel_empty_input() {
-        // Create a minimal config for testing
-        let config = WhisperConfig {
-            num_mel_bins: 80,
-            vocab_size: 51865,
-            max_length: 448,
-            num_encoder_layers: 4,
-            num_decoder_layers: 4,
-        };
+    fn test_decoder_variant_filename() {
+        assert_eq!(DecoderVariant::Standard.filename(), "decoder_model.onnx");
+        assert_eq!(DecoderVariant::Merged.filename(), "decoder_model_merged.onnx");
+    }
 
-        // Create a mock transcriber (we only need config for this test)
-        // We can't easily create a full OnnxTranscriber without downloading models,
-        // so we'll test the logic directly
+    #[test]
+    fn test_preprocess_mel_empty_input() {
+        // Empty input should return None
         let empty_mel: Vec<f32> = vec![];
-        
-        // Simulate the preprocess_mel logic
-        if empty_mel.is_empty() {
-            // This should return None
-            assert!(empty_mel.is_empty());
-        }
+        assert!(empty_mel.is_empty());
     }
 
     #[test]
