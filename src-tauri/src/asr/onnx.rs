@@ -390,35 +390,20 @@ impl OnnxTranscriber {
     /// println!("Transcription: {}", text);
     /// ```
     pub fn transcribe_from_mel(&mut self, mel_spectrogram: &[f32]) -> Result<String> {
-        info!("Starting transcription from mel spectrogram (length: {})", mel_spectrogram.len());
-        
         // Step 1: Preprocess mel spectrogram
-        info!("Step 1: Preprocessing mel spectrogram...");
         let mel_tensor = match self.preprocess_mel(mel_spectrogram) {
-            Some(tensor) => {
-                info!("Mel tensor preprocessed: shape {:?}", tensor.shape());
-                tensor
-            }
-            None => {
-                info!("Empty mel spectrogram, returning empty string");
-                return Ok(String::new());
-            }
+            Some(tensor) => tensor,
+            None => return Ok(String::new()),
         };
 
         // Step 2: Run encoder to get audio features
-        info!("Step 2: Running encoder...");
         let audio_features = self.run_encoder(&mel_tensor)?;
-        info!("Encoder completed: audio features shape {:?}", audio_features.shape());
 
         // Step 3: Generate tokens with decoder
-        info!("Step 3: Generating tokens with decoder...");
         let tokens = self.generate_tokens(&audio_features)?;
-        info!("Token generation completed: {} tokens generated", tokens.len());
 
         // Step 4: Decode and clean text
-        info!("Step 4: Decoding tokens to text...");
         let text = self.decode_and_clean(&tokens)?;
-        info!("Transcription completed: {} characters", text.len());
 
         Ok(text)
     }
@@ -519,17 +504,13 @@ impl OnnxTranscriber {
     fn run_encoder(&mut self, mel_tensor: &Array3<f32>) -> Result<Array3<f32>> {
         use ort::value::Value;
 
-        info!("Creating ONNX value from mel tensor...");
         let mel_value = Value::from_array(mel_tensor.clone())
             .map_err(|e| anyhow!("Failed to create ONNX value from mel tensor: {}", e))?;
 
-        info!("Running encoder inference...");
         let outputs = self.encoder_session
             .run(ort::inputs!["input_features" => mel_value])
             .map_err(|e| anyhow!("Encoder inference failed: {}", e))?;
-        info!("Encoder inference completed");
 
-        info!("Extracting audio features from encoder output...");
         let audio_features = outputs["last_hidden_state"]
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("Failed to extract audio features from encoder output: {}", e))?;
@@ -895,18 +876,19 @@ impl OnnxTranscriber {
     ) -> Result<(Array3<f32>, Option<Vec<ndarray::ArrayD<f32>>>)> {
         use ndarray::Array2;
         use ort::value::Value;
+        use std::borrow::Cow;
 
         // Determine which tokens to process
-        let tokens_to_process = if self.use_kv_cache && !is_first_iteration {
-            // Only process the last token
+        let tokens_to_process = if self.use_kv_cache && !is_first_iteration && past_kv_cache.is_some() {
+            // Only process the last token when using cache
             &input_tokens[input_tokens.len() - 1..]
         } else {
             // Process all tokens (first iteration or no cache)
             input_tokens
         };
 
-        info!("Processing {} tokens (first_iter: {}, use_cache: {})", 
-              tokens_to_process.len(), is_first_iteration, self.use_kv_cache);
+        info!("Processing {} tokens (first_iter: {}, use_cache: {}, has_cache: {})", 
+              tokens_to_process.len(), is_first_iteration, self.use_kv_cache, past_kv_cache.is_some());
 
         // Convert tokens to i64 array (ONNX typically uses int64 for token IDs)
         let tokens_i64: Vec<i64> = tokens_to_process.iter().map(|&t| t as i64).collect();
@@ -915,60 +897,75 @@ impl OnnxTranscriber {
         // Create input_ids tensor: shape (batch_size, sequence_length)
         let input_ids = Array2::from_shape_vec((1, seq_len), tokens_i64)
             .map_err(|e| anyhow!("Failed to create input_ids array: {}", e))?;
-        
-        let input_ids_value = Value::from_array(input_ids.clone())
-            .map_err(|e| anyhow!("Failed to create ONNX value from input_ids: {}", e))?;
-        
-        let audio_features_value = Value::from_array(audio_features.clone())
-            .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
 
         // Build inputs based on cache availability
-        info!("Running decoder inference...");
         let outputs = if self.use_kv_cache {
-            // For KV cache models, we need to check if use_cache_branch input exists
-            // Try with use_cache_branch first
-            let use_cache = !is_first_iteration;
+            // Build inputs dynamically using Vec<(String, Value)>
+            let mut inputs: Vec<(Cow<str>, ort::session::SessionInputValue)> = Vec::new();
+            
+            // Add input_ids
+            let input_ids_value = Value::from_array(input_ids)
+                .map_err(|e| anyhow!("Failed to create ONNX value from input_ids: {}", e))?;
+            inputs.push((Cow::Borrowed("input_ids"), input_ids_value.into()));
+            
+            // Add encoder_hidden_states
+            let audio_features_value = Value::from_array(audio_features.clone())
+                .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
+            inputs.push((Cow::Borrowed("encoder_hidden_states"), audio_features_value.into()));
+            
+            // Add use_cache_branch
+            let use_cache = !is_first_iteration && past_kv_cache.is_some();
             let use_cache_array = ndarray::Array1::from_vec(vec![use_cache]);
             let use_cache_value = Value::from_array(use_cache_array)
                 .map_err(|e| anyhow!("Failed to create use_cache_branch value: {}", e))?;
-
-            info!("Decoder with cache: processing {} tokens (first_iter: {})", tokens_to_process.len(), is_first_iteration);
+            inputs.push((Cow::Borrowed("use_cache_branch"), use_cache_value.into()));
             
-            // For now, we'll extract the cache but not use it in subsequent iterations
-            // This is because dynamically building ONNX inputs is complex with the ort crate
-            // The cache extraction still provides value for future optimization
-            info!("Note: KV cache is extracted but not yet used in generation phase");
-            
-            // Try running with use_cache_branch
-            let result = self.decoder_session.run(ort::inputs![
-                "input_ids" => input_ids_value,
-                "encoder_hidden_states" => audio_features_value,
-                "use_cache_branch" => use_cache_value
-            ]);
-            
-            // Check if it succeeded or if we need fallback
-            if let Ok(outputs) = result {
-                outputs
-            } else {
-                // If use_cache_branch doesn't exist, fall back to standard inputs
-                let err = result.unwrap_err();
-                info!("use_cache_branch not supported, falling back to standard decoder: {}", err);
-                
-                // Need to recreate the values since they were moved
-                let input_ids_value2 = Value::from_array(input_ids)
-                    .map_err(|e| anyhow!("Failed to create ONNX value from input_ids: {}", e))?;
-                let audio_features_value2 = Value::from_array(audio_features.clone())
-                    .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
-                
-                self.decoder_session
-                    .run(ort::inputs![
-                        "input_ids" => input_ids_value2,
-                        "encoder_hidden_states" => audio_features_value2
-                    ])
-                    .map_err(|e| anyhow!("Decoder inference failed: {}", e))?
+            // Add past KV cache if available (for subsequent iterations)
+            if let Some(past_cache) = past_kv_cache {
+                if !is_first_iteration {
+                    let num_layers = self.config.num_decoder_layers;
+                    
+                    for layer_idx in 0..num_layers {
+                        let cache_idx = layer_idx * 4;
+                        
+                        // past_key_values.{layer}.decoder.key
+                        let decoder_key_name = format!("past_key_values.{}.decoder.key", layer_idx);
+                        let decoder_key_value = Value::from_array(past_cache[cache_idx].clone())
+                            .map_err(|e| anyhow!("Failed to create past decoder key value: {}", e))?;
+                        inputs.push((Cow::Owned(decoder_key_name), decoder_key_value.into()));
+                        
+                        // past_key_values.{layer}.decoder.value
+                        let decoder_value_name = format!("past_key_values.{}.decoder.value", layer_idx);
+                        let decoder_value_value = Value::from_array(past_cache[cache_idx + 1].clone())
+                            .map_err(|e| anyhow!("Failed to create past decoder value value: {}", e))?;
+                        inputs.push((Cow::Owned(decoder_value_name), decoder_value_value.into()));
+                        
+                        // past_key_values.{layer}.encoder.key
+                        let encoder_key_name = format!("past_key_values.{}.encoder.key", layer_idx);
+                        let encoder_key_value = Value::from_array(past_cache[cache_idx + 2].clone())
+                            .map_err(|e| anyhow!("Failed to create past encoder key value: {}", e))?;
+                        inputs.push((Cow::Owned(encoder_key_name), encoder_key_value.into()));
+                        
+                        // past_key_values.{layer}.encoder.value
+                        let encoder_value_name = format!("past_key_values.{}.encoder.value", layer_idx);
+                        let encoder_value_value = Value::from_array(past_cache[cache_idx + 3].clone())
+                            .map_err(|e| anyhow!("Failed to create past encoder value value: {}", e))?;
+                        inputs.push((Cow::Owned(encoder_value_name), encoder_value_value.into()));
+                    }
+                }
             }
+            
+            // Run with dynamic inputs
+            self.decoder_session
+                .run(inputs)
+                .map_err(|e| anyhow!("Decoder inference failed: {}", e))?
         } else {
             // Standard decoder without cache
+            let input_ids_value = Value::from_array(input_ids)
+                .map_err(|e| anyhow!("Failed to create ONNX value from input_ids: {}", e))?;
+            let audio_features_value = Value::from_array(audio_features.clone())
+                .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
+            
             info!("Decoder standard mode: processing {} tokens", tokens_to_process.len());
             self.decoder_session
                 .run(ort::inputs![
@@ -977,10 +974,7 @@ impl OnnxTranscriber {
                 ])
                 .map_err(|e| anyhow!("Decoder inference failed: {}", e))?
         };
-        
-        info!("Decoder inference completed");
 
-        info!("Extracting logits from decoder output...");
         let logits = outputs["logits"]
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("Failed to extract logits from decoder output: {}", e))?;
@@ -1007,16 +1001,8 @@ impl OnnxTranscriber {
 
         // Extract KV cache if using cache
         let new_cache = if self.use_kv_cache {
-            // First, let's log what outputs are actually available
-            info!("Available decoder outputs:");
-            for (idx, output) in outputs.iter().enumerate() {
-                info!("  Output {}: {:?}", idx, output);
-            }
-            
             let num_layers = self.config.num_decoder_layers;
             let mut cache_values: Vec<ndarray::ArrayD<f32>> = Vec::with_capacity(num_layers * 4);
-            
-            info!("Extracting KV cache for {} layers...", num_layers);
             
             // Extract cache for each layer
             // Pattern: present.{layer}.decoder.key/value and present.{layer}.encoder.key/value
@@ -1053,7 +1039,6 @@ impl OnnxTranscriber {
                 cache_values.push(array);
             }
             
-            info!("Successfully extracted {} cache tensors", cache_values.len());
             Some(cache_values)
         } else {
             None
@@ -1105,13 +1090,10 @@ impl OnnxTranscriber {
     /// println!("Generated {} tokens", tokens.len());
     /// ```
     fn generate_tokens(&mut self, audio_features: &Array3<f32>) -> Result<Vec<u32>> {
-        info!("Initializing token sequence...");
         let mut tokens = self.initialize_tokens()?;
-        info!("Initial tokens: {:?}", tokens);
         
         // Get end-of-text token ID
         let eot_token = self.get_token_id("<|endoftext|>")?;
-        info!("End-of-text token ID: {}", eot_token);
         
         // Get maximum length from config
         let max_length = self.config.max_length;
@@ -1119,8 +1101,7 @@ impl OnnxTranscriber {
         // Temperature for sampling (0.0 = greedy decoding)
         let temperature = 0.0;
         
-        info!("Starting autoregressive token generation (max_length: {}, use_cache: {})...", 
-              max_length, self.use_kv_cache);
+        info!("Starting token generation (max_length: {}, use_cache: {})", max_length, self.use_kv_cache);
         let mut iteration = 0;
         let mut kv_cache: Option<Vec<ndarray::ArrayD<f32>>> = None;
         
@@ -1137,8 +1118,6 @@ impl OnnxTranscriber {
             let is_first_iteration = iteration == 1;
             
             // Run decoder with current tokens and audio features
-            info!("Iteration {}: Running decoder with {} tokens (first: {})...", 
-                  iteration, tokens.len(), is_first_iteration);
             let (logits, new_cache) = self.run_decoder(
                 &tokens,
                 audio_features,
@@ -1150,21 +1129,18 @@ impl OnnxTranscriber {
             kv_cache = new_cache;
             
             // Sample next token
-            info!("Iteration {}: Sampling next token...", iteration);
             let next_token = self.sample_token(&logits, &tokens, temperature)?;
-            info!("Iteration {}: Sampled token {}", iteration, next_token);
             
             // Append token to sequence
             tokens.push(next_token);
             
             // Check for end-of-text token
             if next_token == eot_token {
-                info!("End-of-text token generated after {} iterations", iteration);
+                info!("Token generation completed: {} tokens in {} iterations", tokens.len(), iteration);
                 break;
             }
         }
         
-        info!("Token generation completed: {} total tokens after {} iterations", tokens.len(), iteration);
         Ok(tokens)
     }
 
