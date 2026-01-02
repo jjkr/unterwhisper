@@ -17,7 +17,7 @@ from mlx_audio.stt.utils import load_model
 SAMPLE_RATE = 16000  # Parakeet expects 16kHz audio
 CHUNK_DURATION = 10.0  # Process audio in 10-second chunks
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
-OVERLAP_DURATION = 9.8  # Overlap between chunks for continuity
+OVERLAP_DURATION = 9.9  # Overlap between chunks for continuity
 OVERLAP_SIZE = int(SAMPLE_RATE * OVERLAP_DURATION)
 
 # Model configuration
@@ -56,11 +56,12 @@ def transcription_worker(model):
             
             # Process when we have enough audio
             if len(audio_buffer) >= CHUNK_SIZE:
-                # Convert to mlx array
-                audio_array = mx.array(list(audio_buffer)[:CHUNK_SIZE], dtype=mx.float32)
+                # Convert to numpy first, then to mlx array
+                audio_np = np.array(list(audio_buffer)[:CHUNK_SIZE], dtype=np.float32)
+                audio_array = mx.array(audio_np)
                 
-                # Transcribe using the model
-                result = model.generate(audio_array, verbose=False)
+                # Transcribe using the model's decode_chunk method (takes audio directly)
+                result = model.decode_chunk(audio_array, verbose=False)
                 
                 text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
                 
