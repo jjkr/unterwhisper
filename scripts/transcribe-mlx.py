@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Real-time microphone transcription using MLX and distil-whisper.
+Real-time microphone transcription using MLX and Parakeet.
 Captures audio from the microphone and transcribes it in real-time.
+
+Requires: pip install mlx-audio sounddevice numpy dacite
 """
 
 import numpy as np
 import sounddevice as sd
 import queue
-import threading
 from collections import deque
 import mlx.core as mx
-from mlx_whisper import load_models, transcribe
+from mlx_audio.stt.utils import load_model
 
 # Configuration
-SAMPLE_RATE = 16000  # Whisper expects 16kHz audio
-CHUNK_DURATION = 10.0  # Process audio in 3-second chunks
+SAMPLE_RATE = 16000  # Parakeet expects 16kHz audio
+CHUNK_DURATION = 10.0  # Process audio in 10-second chunks
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 OVERLAP_DURATION = 9.8  # Overlap between chunks for continuity
 OVERLAP_SIZE = int(SAMPLE_RATE * OVERLAP_DURATION)
 
 # Model configuration
-# Use MLX-converted model from mlx-community
-MODEL_NAME = "mlx-community/whisper-tiny.en-mlx-q4"
+MODEL_NAME = "mlx-community/parakeet-tdt-0.6b-v2"
 
 # Global queue for audio data
 audio_queue = queue.Queue()
@@ -40,11 +40,8 @@ def audio_callback(indata, frames, time_info, status):
     audio_queue.put(audio_data)
 
 
-def transcription_worker(model_path):
-    """Worker thread that processes audio chunks and transcribes them."""
-    print(f"Loading model: {MODEL_NAME}")
-    print("This may take a moment on first run...")
-    
+def transcription_worker(model):
+    """Worker that processes audio chunks and transcribes them."""
     # Buffer to accumulate audio samples
     audio_buffer = deque(maxlen=CHUNK_SIZE + OVERLAP_SIZE)
     
@@ -59,19 +56,13 @@ def transcription_worker(model_path):
             
             # Process when we have enough audio
             if len(audio_buffer) >= CHUNK_SIZE:
-                # Convert to numpy array and normalize
-                audio_array = np.array(list(audio_buffer)[:CHUNK_SIZE], dtype=np.float32)
+                # Convert to mlx array
+                audio_array = mx.array(list(audio_buffer)[:CHUNK_SIZE], dtype=mx.float32)
                 
-                # Transcribe using MLX Whisper
-                result = transcribe(
-                    audio_array,
-                    path_or_hf_repo=MODEL_NAME,
-                    language="en",
-                    word_timestamps=False,
-                    verbose=False
-                )
+                # Transcribe using the model
+                result = model.generate(audio_array, verbose=False)
                 
-                text = result.get("text", "").strip()
+                text = result.text.strip() if hasattr(result, 'text') else str(result).strip()
                 
                 # Only print if there's actual transcribed text
                 if text and text not in ["", ".", "...", "Thank you."]:
@@ -91,12 +82,14 @@ def transcription_worker(model_path):
             break
         except Exception as e:
             print(f"Error during transcription: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
 
 def main():
     """Main function to set up audio stream and start transcription."""
-    print("Real-time Microphone Transcription with MLX Whisper")
+    print("Real-time Microphone Transcription with MLX Audio (Parakeet)")
     print("=" * 60)
     
     # List available audio devices
@@ -112,15 +105,13 @@ def main():
     print(f"Sample rate: {SAMPLE_RATE} Hz")
     print(f"Chunk duration: {CHUNK_DURATION} seconds\n")
     
-    # Start transcription worker thread
-    transcription_thread = threading.Thread(
-        target=transcription_worker,
-        args=(MODEL_NAME,),
-        daemon=True
-    )
-    transcription_thread.start()
+    # Load model
+    print(f"Loading model: {MODEL_NAME}")
+    print("This may take a moment on first run...")
+    model = load_model(MODEL_NAME)
+    print("Model loaded!")
     
-    # Start audio input stream
+    # Start audio input stream and process in main thread
     try:
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -128,12 +119,13 @@ def main():
             callback=audio_callback,
             blocksize=int(SAMPLE_RATE * 0.1)  # 100ms blocks
         ):
-            # Keep main thread alive
-            transcription_thread.join()
+            transcription_worker(model)
     except KeyboardInterrupt:
         print("\nShutting down...")
     except Exception as e:
         print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
