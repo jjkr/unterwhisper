@@ -913,7 +913,9 @@ impl OnnxTranscriber {
                 .map_err(|e| anyhow!("Failed to create ONNX value from audio_features: {}", e))?;
             inputs.push((Cow::Borrowed("encoder_hidden_states"), audio_features_value.into()));
             
-            // Add use_cache_branch
+            // Add use_cache_branch - this tells the model whether to use the cache
+            // On first iteration, we set it to false (no cache to use)
+            // On subsequent iterations, we set it to true (use the cache we're providing)
             let use_cache = !is_first_iteration && past_kv_cache.is_some();
             let use_cache_array = ndarray::Array1::from_vec(vec![use_cache]);
             let use_cache_value = Value::from_array(use_cache_array)
@@ -922,11 +924,17 @@ impl OnnxTranscriber {
             
             // Add past KV cache if available (for subsequent iterations)
             if let Some(past_cache) = past_kv_cache {
-                if !is_first_iteration {
+                if !is_first_iteration && past_cache.len() >= self.config.num_decoder_layers * 4 {
                     let num_layers = self.config.num_decoder_layers;
+                    info!("Adding past KV cache: {} layers, {} tensors", num_layers, past_cache.len());
                     
                     for layer_idx in 0..num_layers {
                         let cache_idx = layer_idx * 4;
+                        
+                        // Validate cache index
+                        if cache_idx + 3 >= past_cache.len() {
+                            return Err(anyhow!("Invalid cache index: {} >= {}", cache_idx + 3, past_cache.len()));
+                        }
                         
                         // past_key_values.{layer}.decoder.key
                         let decoder_key_name = format!("past_key_values.{}.decoder.key", layer_idx);
@@ -955,6 +963,8 @@ impl OnnxTranscriber {
                 }
             }
             
+            info!("Running decoder with {} inputs", inputs.len());
+            
             // Run with dynamic inputs
             self.decoder_session
                 .run(inputs)
@@ -975,15 +985,21 @@ impl OnnxTranscriber {
                 .map_err(|e| anyhow!("Decoder inference failed: {}", e))?
         };
 
-        let logits = outputs["logits"]
+        // Safely extract logits
+        let logits_output = outputs.get("logits")
+            .ok_or_else(|| anyhow!("Logits output not found in decoder output"))?;
+        
+        // Check if the tensor has valid data before extraction
+        let logits = logits_output
             .try_extract_tensor::<f32>()
             .map_err(|e| anyhow!("Failed to extract logits from decoder output: {}", e))?;
-
-        // Get the shape and data
-        let (shape, data) = logits;
         
-        // Convert shape to dimensions
-        let dims = shape.as_ref();
+        // Get the shape and data - copy immediately to avoid lifetime issues
+        let (shape, data) = logits;
+        let dims: Vec<i64> = shape.as_ref().to_vec();
+        let data_vec: Vec<f32> = data.to_vec();
+        
+        // Validate dimensions
         if dims.len() != 3 {
             return Err(anyhow!("Expected 3D logits, got {}D", dims.len()));
         }
@@ -993,53 +1009,64 @@ impl OnnxTranscriber {
         let dim1 = dims[1] as usize;
         let dim2 = dims[2] as usize;
 
-        // Create Array3 from the data
+        // Create Array3 from the copied data
         let logits_array = Array3::from_shape_vec(
             (dim0, dim1, dim2),
-            data.to_vec()
+            data_vec
         ).map_err(|e| anyhow!("Failed to create logits array: {}", e))?;
 
         // Extract KV cache if using cache
         let new_cache = if self.use_kv_cache {
             let num_layers = self.config.num_decoder_layers;
-            let mut cache_values: Vec<ndarray::ArrayD<f32>> = Vec::with_capacity(num_layers * 4);
             
-            // Extract cache for each layer
-            // Pattern: present.{layer}.decoder.key/value and present.{layer}.encoder.key/value
-            for layer_idx in 0..num_layers {
-                let decoder_key_name = format!("present.{}.decoder.key", layer_idx);
-                let decoder_value_name = format!("present.{}.decoder.value", layer_idx);
-                let encoder_key_name = format!("present.{}.encoder.key", layer_idx);
-                let encoder_value_name = format!("present.{}.encoder.value", layer_idx);
+            // Check if cache outputs exist (they might not on subsequent iterations with some models)
+            let first_cache_name = "present.0.decoder.key";
+            if outputs.get(first_cache_name).is_none() {
+                // Cache outputs not present, return None
+                info!("Cache outputs not present in decoder output, skipping cache extraction");
+                None
+            } else {
+                let mut cache_values: Vec<ndarray::ArrayD<f32>> = Vec::with_capacity(num_layers * 4);
                 
-                // Extract decoder self-attention cache
-                let decoder_key = outputs[decoder_key_name.as_str()].try_extract_tensor::<f32>()?;
-                let (shape, data) = decoder_key;
-                let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
-                let array = ndarray::ArrayD::from_shape_vec(dims, data.to_vec())?;
-                cache_values.push(array);
+                // Extract cache for each layer
+                // Pattern: present.{layer}.decoder.key/value and present.{layer}.encoder.key/value
+                for layer_idx in 0..num_layers {
+                    let decoder_key_name = format!("present.{}.decoder.key", layer_idx);
+                    let decoder_value_name = format!("present.{}.decoder.value", layer_idx);
+                    let encoder_key_name = format!("present.{}.encoder.key", layer_idx);
+                    let encoder_value_name = format!("present.{}.encoder.value", layer_idx);
+                    
+                    // Helper function to safely extract tensor data
+                    fn extract_cache_tensor(outputs: &ort::session::SessionOutputs, name: &str) -> Result<ndarray::ArrayD<f32>> {
+                        let tensor = outputs.get(name)
+                            .ok_or_else(|| anyhow!("Cache output '{}' not found", name))?;
+                        
+                        let extracted = tensor.try_extract_tensor::<f32>()
+                            .map_err(|e| anyhow!("Failed to extract tensor '{}': {}", name, e))?;
+                        
+                        let (shape, data) = extracted;
+                        // Copy data immediately to avoid lifetime issues
+                        let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
+                        let data_vec: Vec<f32> = data.to_vec();
+                        
+                        // Check if data is empty
+                        if data_vec.is_empty() {
+                            return Err(anyhow!("Cache tensor '{}' has empty data", name));
+                        }
+                        
+                        ndarray::ArrayD::from_shape_vec(dims, data_vec)
+                            .map_err(|e| anyhow!("Failed to create array for '{}': {}", name, e))
+                    }
+                    
+                    // Extract all cache tensors for this layer
+                    cache_values.push(extract_cache_tensor(&outputs, &decoder_key_name)?);
+                    cache_values.push(extract_cache_tensor(&outputs, &decoder_value_name)?);
+                    cache_values.push(extract_cache_tensor(&outputs, &encoder_key_name)?);
+                    cache_values.push(extract_cache_tensor(&outputs, &encoder_value_name)?);
+                }
                 
-                let decoder_value = outputs[decoder_value_name.as_str()].try_extract_tensor::<f32>()?;
-                let (shape, data) = decoder_value;
-                let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
-                let array = ndarray::ArrayD::from_shape_vec(dims, data.to_vec())?;
-                cache_values.push(array);
-                
-                // Extract encoder cross-attention cache
-                let encoder_key = outputs[encoder_key_name.as_str()].try_extract_tensor::<f32>()?;
-                let (shape, data) = encoder_key;
-                let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
-                let array = ndarray::ArrayD::from_shape_vec(dims, data.to_vec())?;
-                cache_values.push(array);
-                
-                let encoder_value = outputs[encoder_value_name.as_str()].try_extract_tensor::<f32>()?;
-                let (shape, data) = encoder_value;
-                let dims: Vec<usize> = shape.as_ref().iter().map(|&d| d as usize).collect();
-                let array = ndarray::ArrayD::from_shape_vec(dims, data.to_vec())?;
-                cache_values.push(array);
+                Some(cache_values)
             }
-            
-            Some(cache_values)
         } else {
             None
         };
