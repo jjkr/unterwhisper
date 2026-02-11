@@ -165,25 +165,19 @@ fn spawn_transcription_polling_thread(
         .spawn(move || {
             info!("Transcription polling thread started");
 
-            // Try to open an AX text insertion session
+            // Try to open an AX text insertion session.
+            // Note: ax_insertion_active stays false until the first verified write.
             #[cfg(target_os = "macos")]
             let mut ax_session = match ax_text::TextInsertionSession::begin() {
                 ax_text::SessionResult::Active(session) => {
-                    info!("AX text insertion session created");
-                    ax_insertion_active.store(true, Ordering::SeqCst);
+                    info!("AX text insertion session created (pending verification)");
                     Some(session)
                 }
                 ax_text::SessionResult::FallbackNeeded => {
                     info!("AX text insertion unavailable, will use clipboard fallback");
-                    ax_insertion_active.store(false, Ordering::SeqCst);
                     None
                 }
             };
-
-            #[cfg(not(target_os = "macos"))]
-            {
-                ax_insertion_active.store(false, Ordering::SeqCst);
-            }
 
             loop {
                 // Check if still recording
@@ -221,6 +215,11 @@ fn spawn_transcription_polling_thread(
                         if let Some(ref mut session) = ax_session {
                             match session.update_text(&text) {
                                 ax_text::InsertResult::Ok => {
+                                    // First verified success confirms AX is truly working
+                                    if !ax_insertion_active.load(Ordering::SeqCst) {
+                                        info!("AX: first verified write succeeded, enabling AX mode");
+                                        ax_insertion_active.store(true, Ordering::SeqCst);
+                                    }
                                     debug!("AX: streamed text update");
                                 }
                                 ax_text::InsertResult::Retry => {
@@ -248,41 +247,45 @@ fn spawn_transcription_polling_thread(
 /// Stop recording and return final transcription text
 fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, String> {
     info!("Stopping recording");
-    
+
     // Check if actually recording
     if !state.is_recording.load(Ordering::SeqCst) {
         warn!("Not recording, ignoring stop request");
         return Err("Not recording".to_string());
     }
-    
-    // Get transcriber and stop it
+
+    // Get transcriber and stop it — this blocks until the nemo thread has
+    // flushed all remaining audio through the pipeline and exited
     let mut transcriber_guard = state.transcriber.lock()
         .map_err(|e| format!("Failed to lock transcriber: {}", e))?;
-    
+
     let transcriber = transcriber_guard.as_mut()
         .ok_or_else(|| "Transcriber not initialized".to_string())?;
-    
-    // Stop the transcriber
+
     transcriber.stop();
-    
-    // Try to get any remaining transcription results
+
+    // Set recording flag to false — polling thread will exit on next iteration
+    state.is_recording.store(false, Ordering::SeqCst);
+
+    // Brief sleep to let the polling thread pick up any final flushed results
+    // before we drain the channel here (for AX insertion path)
+    thread::sleep(Duration::from_millis(50));
+
+    // Drain any remaining results from the channel for final_text / last_transcription
     let mut final_text = String::new();
     while let Some(result) = transcriber.try_next_transcription() {
         if !result.text.is_empty() {
             final_text = result.text;
         }
     }
-    
+
     drop(transcriber_guard);
-    
-    // Set recording flag to false
-    state.is_recording.store(false, Ordering::SeqCst);
-    
+
     // Check if no speech was detected
     if final_text.trim().is_empty() {
         warn!("No speech detected in recording");
     }
-    
+
     info!("Recording stopped, final text: {}", final_text);
     Ok(final_text)
 }

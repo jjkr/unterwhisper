@@ -111,7 +111,53 @@ impl NemoTranscriber {
 
                 loop {
                     if shutdown_flag.load(Ordering::SeqCst) {
-                        info!("NeMo transcription thread shutting down");
+                        info!("NeMo transcription thread shutting down — flushing remaining audio");
+
+                        // Drain ALL remaining samples from ringbuf
+                        audio_buf.clear();
+                        let available = consumer.occupied_len();
+                        if available > 0 {
+                            audio_buf.resize(available, 0.0f32);
+                            let popped = consumer.pop_slice(&mut audio_buf);
+                            audio_buf.truncate(popped);
+                            if popped > 0 {
+                                debug!("Flush: fed {} remaining samples to NeMo pipeline", popped);
+                                pipeline.add_audio(&audio_buf);
+                            }
+                        }
+
+                        // Signal end of audio stream so pipeline processes remaining buffered audio
+                        pipeline.end_stream();
+
+                        // Loop transcribe_step() until pipeline is fully done
+                        loop {
+                            match pipeline.transcribe_step() {
+                                Ok(Some(output)) => {
+                                    if output.has_new_tokens() {
+                                        debug!("Flush: NeMo transcription: '{}' (final={})", output.text, output.is_final);
+                                        let result = TranscriptionResult {
+                                            text: output.text,
+                                            is_final: output.is_final,
+                                        };
+                                        if let Err(e) = result_tx.send(result) {
+                                            warn!("Flush: failed to send transcription result: {}", e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    // No more data to process
+                                }
+                                Err(e) => {
+                                    warn!("Flush: NeMo transcription step failed: {}", e);
+                                }
+                            }
+                            if pipeline.is_done() {
+                                info!("NeMo pipeline flush complete");
+                                break;
+                            }
+                        }
+
                         break;
                     }
 
@@ -173,15 +219,16 @@ impl NemoTranscriber {
     pub fn stop(&mut self) {
         info!("Stopping NeMo transcription pipeline");
 
-        // Signal shutdown
+        // Drop audio stream FIRST to stop new samples flowing into ringbuf
+        self.audio_stream = None;
+
+        // Then signal shutdown — thread will drain remaining ringbuf samples,
+        // call end_stream(), and flush pipeline before exiting
         if let Some(ref shutdown) = self.shutdown {
             shutdown.store(true, Ordering::SeqCst);
         }
 
-        // Drop audio stream to stop capture
-        self.audio_stream = None;
-
-        // Wait for transcription thread and recover the pipeline
+        // Wait for transcription thread to finish flushing and recover the pipeline
         if let Some(handle) = self.thread_handle.take() {
             match handle.join() {
                 Ok(mut pipeline) => {
@@ -195,8 +242,8 @@ impl NemoTranscriber {
             }
         }
 
-        // Clean up channels and shutdown flag
-        self.result_rx = None;
+        // Clean up shutdown flag but keep result_rx alive so callers can
+        // drain remaining results. It gets overwritten on next start_with_recorder().
         self.shutdown = None;
 
         info!("NeMo transcription pipeline stopped");

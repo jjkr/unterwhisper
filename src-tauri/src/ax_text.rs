@@ -38,6 +38,7 @@ pub struct TextInsertionSession {
     focused_element: AXUIElementRef,
     insertion_offset: CFIndex,
     inserted_length: CFIndex, // in UTF-16 code units (what AX uses)
+    verified: bool,           // true after readback confirms text was actually inserted
 }
 
 // AXUIElementRef is a CFType — safe to send across threads once captured.
@@ -125,6 +126,7 @@ impl TextInsertionSession {
                 focused_element: focused,
                 insertion_offset,
                 inserted_length: 0,
+                verified: false,
             })
         }
     }
@@ -182,7 +184,33 @@ impl TextInsertionSession {
             }
 
             // 3. Update our bookkeeping with the new UTF-16 length
-            self.inserted_length = cf_text.char_len() as CFIndex;
+            let new_len = cf_text.char_len() as CFIndex;
+            self.inserted_length = new_len;
+
+            // 4. On the first successful write, verify by reading cursor position back.
+            //    If the cursor didn't move to where we expect, the app silently ignored
+            //    the write (common with web content areas, some Electron apps, etc.).
+            if !self.verified {
+                let expected_cursor = self.insertion_offset + new_len;
+                match Self::get_cursor_offset(self.focused_element) {
+                    Some(actual) if actual == expected_cursor => {
+                        info!("AX: verified — cursor at expected position {}", actual);
+                        self.verified = true;
+                    }
+                    Some(actual) => {
+                        warn!(
+                            "AX: verification failed — cursor at {} but expected {} \
+                             (app likely ignored the write)",
+                            actual, expected_cursor
+                        );
+                        return InsertResult::Failed;
+                    }
+                    None => {
+                        warn!("AX: verification failed — could not read cursor back");
+                        return InsertResult::Failed;
+                    }
+                }
+            }
 
             debug!(
                 "AX: updated text ({} UTF-16 units at offset {})",
