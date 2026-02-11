@@ -40,6 +40,8 @@ mlx-nemo = { path = "../../mlx-nemo-rs" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility-sys = "0.1"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 
 [dev-dependencies]
 proptest = "1.9.0"

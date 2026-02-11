@@ -21,18 +21,6 @@
         "resizable": true,
         "minimizable": true,
         "closable": true
-      },
-      {
-        "label": "transcription",
-        "title": "Transcription",
-        "width": 600,
-        "height": 200,
-        "center": true,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "visible": false,
-        "skipTaskbar": true
       }
     ],
     "security": {

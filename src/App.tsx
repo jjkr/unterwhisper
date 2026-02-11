@@ -1,7 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import TranscriptionWindow from "./TranscriptionWindow";
 import { SettingsDialog } from "./SettingsDialog";
 import "./App.css";
 
@@ -42,12 +41,7 @@ function App() {
     getLabel();
   }, []);
 
-  // Render transcription window if this is the transcription window
-  if (windowLabel === "transcription") {
-    return <TranscriptionWindow />;
-  }
-
-  // Otherwise render the main app (settings window)
+  // Render the main app (settings window)
   return (
     <main className="container">
       {/* Settings Dialog - auto-opens when window is shown */}

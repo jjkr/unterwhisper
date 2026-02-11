@@ -10,6 +10,8 @@ use enigo::{Enigo, Key, Keyboard, Settings as EnigoSettings};
 
 mod settings;
 mod asr;
+#[cfg(target_os = "macos")]
+mod ax_text;
 
 pub use settings::Settings;
 use asr::NemoTranscriber;
@@ -52,15 +54,21 @@ fn check_microphone_permission() -> bool {
 pub struct AppState {
     /// The NeMo transcriber instance (created once, reused)
     pub transcriber: Arc<Mutex<Option<NemoTranscriber>>>,
-    
+
     /// Flag indicating whether recording is currently active
     pub is_recording: Arc<AtomicBool>,
-    
+
     /// Application settings
     pub settings: Arc<Mutex<Option<Settings>>>,
-    
+
     /// Global hotkey manager (kept alive for app lifetime)
     pub hotkey_manager: Arc<Mutex<Option<GlobalHotKeyManager>>>,
+
+    /// Whether the current recording session is using AX text insertion
+    pub ax_insertion_active: Arc<AtomicBool>,
+
+    /// Latest transcription text (for clipboard fallback when AX is unavailable)
+    pub last_transcription: Arc<Mutex<String>>,
 }
 
 impl AppState {
@@ -71,6 +79,8 @@ impl AppState {
             is_recording: Arc::new(AtomicBool::new(false)),
             settings: Arc::new(Mutex::new(None)),
             hotkey_manager: Arc::new(Mutex::new(None)),
+            ax_insertion_active: Arc::new(AtomicBool::new(false)),
+            last_transcription: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -136,26 +146,52 @@ impl AppState {
     
 }
 
-/// Spawn a background thread to poll for transcription updates
+/// Spawn a background thread to poll for transcription updates.
+///
+/// On macOS, attempts to create an AX text insertion session to stream text
+/// directly into the focused app. Falls back to accumulating text for
+/// clipboard paste if AX is unavailable.
 fn spawn_transcription_polling_thread(
     state: &AppState,
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
 ) {
     let transcriber = state.transcriber.clone();
     let is_recording = state.is_recording.clone();
-    
+    let ax_insertion_active = state.ax_insertion_active.clone();
+    let last_transcription = state.last_transcription.clone();
+
     thread::Builder::new()
         .name("transcription-poller".to_string())
         .spawn(move || {
             info!("Transcription polling thread started");
-            
+
+            // Try to open an AX text insertion session
+            #[cfg(target_os = "macos")]
+            let mut ax_session = match ax_text::TextInsertionSession::begin() {
+                ax_text::SessionResult::Active(session) => {
+                    info!("AX text insertion session created");
+                    ax_insertion_active.store(true, Ordering::SeqCst);
+                    Some(session)
+                }
+                ax_text::SessionResult::FallbackNeeded => {
+                    info!("AX text insertion unavailable, will use clipboard fallback");
+                    ax_insertion_active.store(false, Ordering::SeqCst);
+                    None
+                }
+            };
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                ax_insertion_active.store(false, Ordering::SeqCst);
+            }
+
             loop {
                 // Check if still recording
                 if !is_recording.load(Ordering::SeqCst) {
                     info!("Recording stopped, exiting transcription polling thread");
                     break;
                 }
-                
+
                 // Try to get transcription update
                 let transcription_text = {
                     let mut transcriber_guard = match transcriber.lock() {
@@ -166,29 +202,44 @@ fn spawn_transcription_polling_thread(
                             continue;
                         }
                     };
-                    
-                    // Try to get next transcription (non-blocking)
+
                     if let Some(transcriber) = transcriber_guard.as_mut() {
                         transcriber.try_next_transcription().map(|result| result.text)
                     } else {
                         None
                     }
                 };
-                
-                // Emit transcription update if we got one
+
                 if let Some(text) = transcription_text {
                     if !text.is_empty() {
-                        info!("Emitting transcription update: {}", text);
-                        if let Err(e) = app.emit("transcription-update", text) {
-                            error!("Failed to emit transcription-update event: {}", e);
+                        // Always store the latest text for clipboard fallback
+                        if let Ok(mut last) = last_transcription.lock() {
+                            *last = text.clone();
+                        }
+
+                        #[cfg(target_os = "macos")]
+                        if let Some(ref mut session) = ax_session {
+                            match session.update_text(&text) {
+                                ax_text::InsertResult::Ok => {
+                                    debug!("AX: streamed text update");
+                                }
+                                ax_text::InsertResult::Retry => {
+                                    debug!("AX: transient error, will retry");
+                                }
+                                ax_text::InsertResult::Failed => {
+                                    warn!("AX: permanent failure, disabling AX for this session");
+                                    ax_session = None;
+                                    ax_insertion_active.store(false, Ordering::SeqCst);
+                                }
+                            }
                         }
                     }
                 }
-                
+
                 // Sleep briefly to avoid busy-waiting
                 thread::sleep(Duration::from_millis(100));
             }
-            
+
             info!("Transcription polling thread stopped");
         })
         .expect("Failed to spawn transcription polling thread");
@@ -234,56 +285,6 @@ fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, S
     
     info!("Recording stopped, final text: {}", final_text);
     Ok(final_text)
-}
-
-/// Show a window by label
-fn show_window(app: &tauri::AppHandle, label: &str) -> Result<(), String> {
-    info!("Showing window: {}", label);
-    debug!("Attempting to get window with label: '{}'", label);
-    
-    // Get window by label
-    let window = app.get_webview_window(label)
-        .ok_or_else(|| {
-            error!("Window not found: {}", label);
-            format!("Window not found: {}", label)
-        })?;
-    
-    debug!("Window '{}' found, calling show()", label);
-    
-    // Show the window
-    window.show()
-        .map_err(|e| {
-            error!("Failed to show window {}: {}", label, e);
-            format!("Failed to show window {}: {}", label, e)
-        })?;
-    
-    info!("Window {} shown successfully", label);
-    Ok(())
-}
-
-/// Hide a window by label
-fn hide_window(app: &tauri::AppHandle, label: &str) -> Result<(), String> {
-    info!("Hiding window: {}", label);
-    debug!("Attempting to get window with label: '{}'", label);
-    
-    // Get window by label
-    let window = app.get_webview_window(label)
-        .ok_or_else(|| {
-            error!("Window not found: {}", label);
-            format!("Window not found: {}", label)
-        })?;
-    
-    debug!("Window '{}' found, calling hide()", label);
-    
-    // Hide the window
-    window.hide()
-        .map_err(|e| {
-            error!("Failed to hide window {}: {}", label, e);
-            format!("Failed to hide window {}: {}", label, e)
-        })?;
-    
-    info!("Window {} hidden successfully", label);
-    Ok(())
 }
 
 /// Copy text to clipboard and simulate Cmd+V paste
@@ -459,21 +460,12 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
     state.is_recording.store(true, Ordering::SeqCst);
     debug!("Recording flag set to true");
 
-    // Show the transcription window directly
-    debug!("Showing transcription window...");
-    show_window(app, "transcription")
-        .map_err(|e| {
-            error!("Failed to show transcription window: {}", e);
-            anyhow::anyhow!("Failed to show transcription window: {}", e)
-        })?;
-    debug!("Transcription window shown");
-    
-    // Also emit event for frontend to update state
-    debug!("Emitting show-window event...");
-    let _ = app.emit("show-window", ());
-    debug!("Event emitted");
-    
-    // Spawn transcription polling thread
+    // Clear last transcription for this session
+    if let Ok(mut last) = state.last_transcription.lock() {
+        last.clear();
+    }
+
+    // Spawn transcription polling thread (will attempt AX text insertion)
     debug!("Spawning transcription polling thread...");
     spawn_transcription_polling_thread(state, app.clone());
     debug!("Transcription polling thread spawned");
@@ -549,30 +541,37 @@ fn handle_hotkey_event(app: &tauri::AppHandle, event: GlobalHotKeyEvent) {
         }
         HotKeyState::Released => {
             info!("Hotkey released - stopping recording");
-            
-            // Stop recording
+
+            let ax_was_active = state.ax_insertion_active.load(Ordering::SeqCst);
+
+            // Stop recording (drains remaining results)
             match stop_recording(&state, app) {
-                Ok(text) => {
-                    info!("Recording stopped with text: {}", text);
-                    
-                    // Copy and paste the transcription
-                    if let Err(e) = copy_and_paste(&text, app) {
-                        error!("Failed to copy and paste: {}", e);
+                Ok(final_text) => {
+                    info!("Recording stopped with text: {}", final_text);
+
+                    if ax_was_active {
+                        // Text was already streamed into the app via AX — nothing to do
+                        info!("AX insertion was active, text already in place");
+                    } else {
+                        // Fallback: get the latest transcription and clipboard-paste it
+                        let text = {
+                            let last = state.last_transcription.lock()
+                                .map(|t| t.clone())
+                                .unwrap_or_default();
+                            if last.is_empty() { final_text } else { last }
+                        };
+
+                        if let Err(e) = copy_and_paste(&text, app) {
+                            error!("Failed to copy and paste: {}", e);
+                        }
                     }
-                    
-                    // Wait 1 second before hiding window
-                    thread::sleep(Duration::from_secs(1));
-                    
-                    // Hide the transcription window directly
-                    if let Err(e) = hide_window(app, "transcription") {
-                        error!("Failed to hide transcription window: {}", e);
-                    }
-                    
-                    // Also emit event for frontend
-                    let _ = app.emit("hide-window", ());
+
+                    // Reset for next session
+                    state.ax_insertion_active.store(false, Ordering::SeqCst);
                 }
                 Err(e) => {
                     error!("Failed to stop recording: {}", e);
+                    state.ax_insertion_active.store(false, Ordering::SeqCst);
                 }
             }
         }
@@ -827,8 +826,8 @@ pub fn run() {
 
             info!("System tray created successfully");
 
-            // Register global hotkey (Cmd+Shift+Space)
-            info!("Registering global hotkey (Cmd+Shift+Space)...");
+            // Register global hotkey (Option+V)
+            info!("Registering global hotkey (Option+V)...");
             
             // Check accessibility permissions first
             if !check_accessibility_permission() {
@@ -844,7 +843,7 @@ pub fn run() {
                 }
             };
             
-            let hotkey = HotKey::new(Some(Modifiers::SUPER | Modifiers::SHIFT), Code::Space);
+            let hotkey = HotKey::new(Some(Modifiers::ALT), Code::KeyV);
             
             if let Err(e) = hotkey_manager.register(hotkey) {
                 error!("Failed to register hotkey: {} - the hotkey may be in use by another application, or Accessibility permissions may not be granted. You can still use the tray menu to start recording.", e);
@@ -861,7 +860,7 @@ pub fn run() {
             // Spawn background thread to poll for hotkey events
             spawn_hotkey_polling_thread(app.handle().clone());
             
-            info!("Unterwhisper started - press Cmd+Shift+Space to start recording, or use the tray menu");
+            info!("Unterwhisper started - press Option+V to start recording, or use the tray menu");
             info!("Tauri setup completed successfully");
 
             Ok(())
