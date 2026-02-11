@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { DeviceSelector } from './DeviceSelector';
 import './SettingsDialog.css';
 
@@ -15,27 +16,21 @@ interface Settings {
 }
 
 interface SettingsDialogProps {
-  isOpen: boolean;
   onClose: () => void;
 }
 
-export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
+export function SettingsDialog({ onClose }: SettingsDialogProps) {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
-  useEffect(() => {
-    if (isOpen) {
-      loadSettings();
-    }
-  }, [isOpen]);
-
-  const loadSettings = async () => {
+  const loadSettings = useCallback(async (showLoading: boolean) => {
     try {
-      setLoading(true);
+      if (showLoading) setLoading(true);
       setError(null);
+      setSaveSuccess(false);
       const loadedSettings = await invoke<Settings>('get_settings');
       setSettings(loadedSettings);
     } catch (err) {
@@ -44,7 +39,24 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  // Initial load
+  useEffect(() => {
+    loadSettings(true);
+  }, [loadSettings]);
+
+  // Silently refresh settings when the window regains focus
+  // (e.g. reopened from tray menu after being hidden)
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      if (focused) {
+        loadSettings(false);
+      }
+    }).then(fn => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [loadSettings]);
 
   const handleSave = async () => {
     if (!settings) return;
@@ -55,7 +67,7 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
       setSaveSuccess(false);
       await invoke('update_settings', { settings });
       setSaveSuccess(true);
-      
+
       // Auto-close after successful save
       setTimeout(() => {
         onClose();
@@ -86,8 +98,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     }
   };
 
-  if (!isOpen) return null;
-
   return (
     <div className="settings-dialog-overlay" onClick={onClose}>
       <div className="settings-dialog" onClick={(e) => e.stopPropagation()}>
@@ -104,7 +114,7 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
           ) : error && !settings ? (
             <div className="error">
               <p>Error loading settings: {error}</p>
-              <button onClick={loadSettings}>Retry</button>
+              <button onClick={() => loadSettings(true)}>Retry</button>
             </div>
           ) : settings ? (
             <form onSubmit={(e) => { e.preventDefault(); handleSave(); }}>
