@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 use arboard::Clipboard;
-use enigo::{Enigo, Key, Keyboard, Settings as EnigoSettings};
+use enigo::{Direction, Enigo, Key, Keyboard, Settings as EnigoSettings};
 
 mod settings;
 mod asr;
@@ -146,11 +146,53 @@ impl AppState {
     
 }
 
+/// Insert/update text using keyboard simulation (backspace + type).
+///
+/// Computes the diff between `previous_text` and `new_text`, deletes changed
+/// characters with backspace, and types the new suffix. This avoids retyping
+/// the entire string on each hypothesis update.
+fn keyboard_insert_text(enigo: &mut Enigo, new_text: &str, previous_text: &mut String) -> bool {
+    // Find common prefix length (in chars)
+    let common_len = previous_text
+        .chars()
+        .zip(new_text.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let chars_to_delete = previous_text.chars().count() - common_len;
+    let new_suffix: String = new_text.chars().skip(common_len).collect();
+
+    // Delete changed portion with backspace
+    for _ in 0..chars_to_delete {
+        if let Err(e) = enigo.key(Key::Backspace, Direction::Click) {
+            warn!("Keyboard insert: backspace failed: {}", e);
+            return false;
+        }
+    }
+
+    // Type the new suffix
+    if !new_suffix.is_empty() {
+        if let Err(e) = enigo.text(&new_suffix) {
+            warn!("Keyboard insert: typing failed: {}", e);
+            return false;
+        }
+    }
+
+    *previous_text = new_text.to_string();
+    debug!(
+        "Keyboard: updated text ({} deleted, {} typed)",
+        chars_to_delete,
+        new_suffix.len()
+    );
+    true
+}
+
 /// Spawn a background thread to poll for transcription updates.
 ///
 /// On macOS, attempts to create an AX text insertion session to stream text
-/// directly into the focused app. Falls back to accumulating text for
-/// clipboard paste if AX is unavailable.
+/// directly into the focused app. Falls back to keyboard simulation (backspace
+/// + type) for live insertion, and finally to clipboard paste on release if
+/// neither works.
 fn spawn_transcription_polling_thread(
     state: &AppState,
     _app: tauri::AppHandle,
@@ -174,10 +216,25 @@ fn spawn_transcription_polling_thread(
                     Some(session)
                 }
                 ax_text::SessionResult::FallbackNeeded => {
-                    info!("AX text insertion unavailable, will use clipboard fallback");
+                    info!("AX text insertion unavailable, will use keyboard fallback");
                     None
                 }
             };
+
+            // Track last text successfully inserted by AX (for smooth transition
+            // to keyboard if AX fails mid-session)
+            #[cfg(target_os = "macos")]
+            let mut last_ax_text = String::new();
+
+            // Create keyboard controller for fallback live insertion
+            let mut enigo = match Enigo::new(&EnigoSettings::default()) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    warn!("Failed to create keyboard controller for live insertion: {}", e);
+                    None
+                }
+            };
+            let mut kb_previous_text = String::new();
 
             loop {
                 // Check if still recording
@@ -206,29 +263,48 @@ fn spawn_transcription_polling_thread(
 
                 if let Some(text) = transcription_text {
                     if !text.is_empty() {
-                        // Always store the latest text for clipboard fallback
+                        // Always store the latest text for final clipboard fallback
                         if let Ok(mut last) = last_transcription.lock() {
                             *last = text.clone();
                         }
+
+                        let mut inserted = false;
 
                         #[cfg(target_os = "macos")]
                         if let Some(ref mut session) = ax_session {
                             match session.update_text(&text) {
                                 ax_text::InsertResult::Ok => {
-                                    // First verified success confirms AX is truly working
+                                    inserted = true;
+                                    last_ax_text = text.clone();
+                                    // First verified success confirms live insertion is working
                                     if !ax_insertion_active.load(Ordering::SeqCst) {
-                                        info!("AX: first verified write succeeded, enabling AX mode");
+                                        info!("AX: first verified write succeeded, enabling live insertion");
                                         ax_insertion_active.store(true, Ordering::SeqCst);
                                     }
                                     debug!("AX: streamed text update");
                                 }
                                 ax_text::InsertResult::Retry => {
                                     debug!("AX: transient error, will retry");
+                                    inserted = true; // Don't fall through to keyboard
                                 }
                                 ax_text::InsertResult::Failed => {
-                                    warn!("AX: permanent failure, disabling AX for this session");
+                                    warn!("AX: permanent failure, switching to keyboard fallback");
                                     ax_session = None;
-                                    ax_insertion_active.store(false, Ordering::SeqCst);
+                                    // Sync keyboard state with what AX already inserted
+                                    kb_previous_text = last_ax_text.clone();
+                                    // Fall through to keyboard below
+                                }
+                            }
+                        }
+
+                        // Keyboard fallback: live-insert using backspace + type
+                        if !inserted {
+                            if let Some(ref mut enigo) = enigo {
+                                if keyboard_insert_text(enigo, &text, &mut kb_previous_text) {
+                                    if !ax_insertion_active.load(Ordering::SeqCst) {
+                                        info!("Keyboard: live insertion active");
+                                        ax_insertion_active.store(true, Ordering::SeqCst);
+                                    }
                                 }
                             }
                         }
@@ -439,7 +515,8 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
         }
     }
 
-    // Get transcriber and start it with the recorder
+    // Initialize audio stream if needed (expensive, but only first time),
+    // then start the transcription pipeline (cheap — just resumes stream + spawns thread)
     debug!("Acquiring transcriber lock...");
     let mut transcriber_guard = state.transcriber.lock()
         .map_err(|e| {
@@ -451,9 +528,11 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
     let transcriber = transcriber_guard.as_mut()
         .ok_or_else(|| anyhow::anyhow!("Transcriber not initialized"))?;
 
-    // Start transcriber with custom recorder
-    debug!("Starting transcriber with custom recorder...");
-    transcriber.start_with_recorder(recorder)?;
+    debug!("Ensuring audio stream is ready...");
+    transcriber.ensure_audio_ready(recorder)?;
+
+    debug!("Starting transcription pipeline...");
+    transcriber.start()?;
     debug!("Transcriber started successfully");
 
     drop(transcriber_guard);
@@ -529,54 +608,55 @@ fn handle_quit(_app: &tauri::AppHandle) {
     _app.exit(0);
 }
 
-/// Handle global hotkey events (press and release)
+/// Handle global hotkey events — toggle recording on press, ignore release
 fn handle_hotkey_event(app: &tauri::AppHandle, event: GlobalHotKeyEvent) {
+    // Only act on key-down; ignore release
+    if event.state != HotKeyState::Pressed {
+        return;
+    }
+
     let state = app.state::<AppState>();
-    
-    match event.state {
-        HotKeyState::Pressed => {
-            info!("Hotkey pressed - starting recording");
-            
-            // Start recording
-            if let Err(e) = start_recording(&state, app) {
-                error!("Failed to start recording: {:?}", e);
+
+    if state.is_recording.load(Ordering::SeqCst) {
+        // Currently recording → stop
+        info!("Hotkey pressed - stopping recording");
+
+        let ax_was_active = state.ax_insertion_active.load(Ordering::SeqCst);
+
+        match stop_recording(&state, app) {
+            Ok(final_text) => {
+                info!("Recording stopped with text: {}", final_text);
+
+                if ax_was_active {
+                    // Text was already streamed live (via AX or keyboard) — nothing to do
+                    info!("Live insertion was active, text already in place");
+                } else {
+                    // Fallback: get the latest transcription and clipboard-paste it
+                    let text = {
+                        let last = state.last_transcription.lock()
+                            .map(|t| t.clone())
+                            .unwrap_or_default();
+                        if last.is_empty() { final_text } else { last }
+                    };
+
+                    if let Err(e) = copy_and_paste(&text, app) {
+                        error!("Failed to copy and paste: {}", e);
+                    }
+                }
+
+                state.ax_insertion_active.store(false, Ordering::SeqCst);
+            }
+            Err(e) => {
+                error!("Failed to stop recording: {}", e);
+                state.ax_insertion_active.store(false, Ordering::SeqCst);
             }
         }
-        HotKeyState::Released => {
-            info!("Hotkey released - stopping recording");
+    } else {
+        // Not recording → start
+        info!("Hotkey pressed - starting recording");
 
-            let ax_was_active = state.ax_insertion_active.load(Ordering::SeqCst);
-
-            // Stop recording (drains remaining results)
-            match stop_recording(&state, app) {
-                Ok(final_text) => {
-                    info!("Recording stopped with text: {}", final_text);
-
-                    if ax_was_active {
-                        // Text was already streamed into the app via AX — nothing to do
-                        info!("AX insertion was active, text already in place");
-                    } else {
-                        // Fallback: get the latest transcription and clipboard-paste it
-                        let text = {
-                            let last = state.last_transcription.lock()
-                                .map(|t| t.clone())
-                                .unwrap_or_default();
-                            if last.is_empty() { final_text } else { last }
-                        };
-
-                        if let Err(e) = copy_and_paste(&text, app) {
-                            error!("Failed to copy and paste: {}", e);
-                        }
-                    }
-
-                    // Reset for next session
-                    state.ax_insertion_active.store(false, Ordering::SeqCst);
-                }
-                Err(e) => {
-                    error!("Failed to stop recording: {}", e);
-                    state.ax_insertion_active.store(false, Ordering::SeqCst);
-                }
-            }
+        if let Err(e) = start_recording(&state, app) {
+            error!("Failed to start recording: {:?}", e);
         }
     }
 }

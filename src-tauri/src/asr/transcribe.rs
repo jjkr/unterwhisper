@@ -1,9 +1,10 @@
 use crate::asr::audio::AudioRecorder;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use cpal::traits::StreamTrait;
 use crossbeam_channel::{unbounded, Receiver};
 use log::{debug, info, warn};
 use mlx_nemo::asr::CacheAwareRNNTPipeline;
-use ringbuf::{traits::*, HeapRb};
+use ringbuf::{traits::*, HeapCons, HeapRb};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -35,13 +36,21 @@ pub struct TranscriptionResult {
     pub is_final: bool,
 }
 
-/// Real-time audio transcriber using NeMo streaming pipeline
+/// Real-time audio transcriber using NeMo streaming pipeline.
+///
+/// The audio stream is initialized once and persists across recording sessions
+/// (paused when not recording, resumed on start). This avoids the cost of
+/// re-opening the audio device and re-creating the resampler on every keypress.
 pub struct NemoTranscriber {
     /// The NeMo pipeline (owned when not recording)
     pipeline: Option<CacheAwareRNNTPipeline>,
 
-    /// Audio stream handle (kept alive during recording)
+    /// Persistent audio stream (paused between recording sessions)
     audio_stream: Option<cpal::Stream>,
+
+    /// Ringbuf consumer — lives here between sessions, moves into the
+    /// transcription thread during recording, returned on stop
+    ring_consumer: Option<HeapCons<f32>>,
 
     /// Transcription results channel
     result_rx: Option<Receiver<TranscriptionResult>>,
@@ -49,8 +58,8 @@ pub struct NemoTranscriber {
     /// Shutdown signal
     shutdown: Option<Arc<AtomicBool>>,
 
-    /// Transcription thread handle
-    thread_handle: Option<thread::JoinHandle<CacheAwareRNNTPipeline>>,
+    /// Transcription thread handle (returns pipeline + consumer on exit)
+    thread_handle: Option<thread::JoinHandle<(CacheAwareRNNTPipeline, HeapCons<f32>)>>,
 }
 
 impl NemoTranscriber {
@@ -68,14 +77,44 @@ impl NemoTranscriber {
         Ok(Self {
             pipeline: Some(pipeline),
             audio_stream: None,
+            ring_consumer: None,
             result_rx: None,
             shutdown: None,
             thread_handle: None,
         })
     }
 
-    /// Start transcription with a given audio recorder
-    pub fn start_with_recorder(&mut self, recorder: AudioRecorder) -> Result<()> {
+    /// Initialize the audio stream if not already set up.
+    ///
+    /// Only performs the expensive device open / resampler creation on the
+    /// first call. Subsequent calls are a no-op unless `reset_audio()` was
+    /// called (e.g. after a device change in Settings).
+    pub fn ensure_audio_ready(&mut self, recorder: AudioRecorder) -> Result<()> {
+        if self.audio_stream.is_some() {
+            info!("Audio stream already initialized, reusing");
+            return Ok(());
+        }
+
+        info!("Initializing audio stream (first time or after device change)");
+
+        // Create ringbuf for audio transfer (2 seconds buffer at 16kHz)
+        let ringbuf = HeapRb::<f32>::new(16000 * 2);
+        let (producer, consumer) = ringbuf.split();
+
+        // Build and start the audio stream, then immediately pause it
+        let stream = recorder.start_streaming_ringbuf(producer)?;
+        stream.pause().context("Failed to pause audio stream after creation")?;
+
+        self.audio_stream = Some(stream);
+        self.ring_consumer = Some(consumer);
+
+        info!("Audio stream initialized and paused");
+        Ok(())
+    }
+
+    /// Start transcription. The audio stream must already be initialized via
+    /// `ensure_audio_ready`.
+    pub fn start(&mut self) -> Result<()> {
         info!("Starting NeMo transcription pipeline");
 
         // Take ownership of the pipeline for the transcription thread
@@ -84,13 +123,19 @@ impl NemoTranscriber {
             .take()
             .ok_or_else(|| anyhow::anyhow!("Pipeline not available (already running?)"))?;
 
-        // Create ringbuf for audio transfer (2 seconds buffer at 16kHz)
-        let ringbuf = HeapRb::<f32>::new(16000 * 2);
-        let (producer, mut consumer) = ringbuf.split();
+        // Take the ringbuf consumer for the transcription thread
+        let mut consumer = self
+            .ring_consumer
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Audio not initialized — call ensure_audio_ready first"))?;
 
-        // Start audio capture
-        let stream = recorder.start_streaming_ringbuf(producer)?;
-        self.audio_stream = Some(stream);
+        // Drain any stale samples left over from the previous session
+        while consumer.try_pop().is_some() {}
+
+        // Resume the audio stream
+        if let Some(ref stream) = self.audio_stream {
+            stream.play().context("Failed to resume audio stream")?;
+        }
 
         // Create result channel
         let (result_tx, result_rx) = unbounded::<TranscriptionResult>();
@@ -201,7 +246,7 @@ impl NemoTranscriber {
                 }
 
                 info!("NeMo transcription thread stopped");
-                pipeline
+                (pipeline, consumer)
             })?;
 
         self.thread_handle = Some(handle);
@@ -215,38 +260,58 @@ impl NemoTranscriber {
         self.result_rx.as_ref()?.try_recv().ok()
     }
 
-    /// Stop the transcription pipeline
+    /// Stop the transcription pipeline.
+    ///
+    /// Pauses the audio stream (keeps it alive for reuse) and waits for the
+    /// transcription thread to flush remaining audio and exit.
     pub fn stop(&mut self) {
         info!("Stopping NeMo transcription pipeline");
 
-        // Drop audio stream FIRST to stop new samples flowing into ringbuf
-        self.audio_stream = None;
+        // Pause the audio stream to stop new samples flowing into ringbuf.
+        // The stream stays alive for reuse on the next start().
+        if let Some(ref stream) = self.audio_stream {
+            if let Err(e) = stream.pause() {
+                warn!("Failed to pause audio stream: {}", e);
+            }
+        }
 
-        // Then signal shutdown — thread will drain remaining ringbuf samples,
+        // Signal shutdown — thread will drain remaining ringbuf samples,
         // call end_stream(), and flush pipeline before exiting
         if let Some(ref shutdown) = self.shutdown {
             shutdown.store(true, Ordering::SeqCst);
         }
 
-        // Wait for transcription thread to finish flushing and recover the pipeline
+        // Wait for transcription thread to finish flushing and recover
+        // both the pipeline and the ringbuf consumer for reuse
         if let Some(handle) = self.thread_handle.take() {
             match handle.join() {
-                Ok(mut pipeline) => {
+                Ok((mut pipeline, consumer)) => {
                     pipeline.reset();
                     self.pipeline = Some(pipeline);
-                    info!("Pipeline recovered and reset for reuse");
+                    self.ring_consumer = Some(consumer);
+                    info!("Pipeline and audio consumer recovered for reuse");
                 }
                 Err(_) => {
-                    warn!("Transcription thread panicked, pipeline lost");
+                    warn!("Transcription thread panicked, pipeline and consumer lost");
+                    // Audio stream is now orphaned (consumer gone) — force reinit
+                    self.audio_stream = None;
                 }
             }
         }
 
         // Clean up shutdown flag but keep result_rx alive so callers can
-        // drain remaining results. It gets overwritten on next start_with_recorder().
+        // drain remaining results. It gets overwritten on next start().
         self.shutdown = None;
 
         info!("NeMo transcription pipeline stopped");
+    }
+
+    /// Drop the audio stream so the next `ensure_audio_ready` reinitializes it.
+    /// Call this when the audio device setting changes.
+    pub fn reset_audio(&mut self) {
+        info!("Resetting audio stream (will reinitialize on next recording)");
+        self.audio_stream = None;
+        self.ring_consumer = None;
     }
 }
 
@@ -255,7 +320,8 @@ impl Drop for NemoTranscriber {
         if let Some(ref shutdown) = self.shutdown {
             shutdown.store(true, Ordering::SeqCst);
         }
-        // Drop the audio stream so the thread's consumer disconnects
+        // Drop the audio stream and consumer
         self.audio_stream = None;
+        self.ring_consumer = None;
     }
 }
