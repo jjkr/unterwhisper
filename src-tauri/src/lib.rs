@@ -320,8 +320,27 @@ fn spawn_transcription_polling_thread(
         .expect("Failed to spawn transcription polling thread");
 }
 
+/// Create a red-tinted version of the owl icon for the recording indicator.
+fn create_recording_icon() -> tauri::image::Image<'static> {
+    let icon = tauri::image::Image::from_bytes(
+        include_bytes!("../icons/OwlHead-EyesHatOnly.png"),
+    )
+    .expect("failed to decode icon");
+    let (w, h) = (icon.width(), icon.height());
+    let mut rgba = icon.rgba().to_vec();
+    // Tint: for each visible pixel, set to warm amber-orange
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel[3] > 0 {
+            pixel[0] = 245; // R
+            pixel[1] = 166; // G
+            pixel[2] = 35;  // B
+        }
+    }
+    tauri::image::Image::new_owned(rgba, w, h)
+}
+
 /// Stop recording and return final transcription text
-fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, String> {
+fn stop_recording(state: &AppState, app: &tauri::AppHandle) -> Result<String, String> {
     info!("Stopping recording");
 
     // Check if actually recording
@@ -342,6 +361,16 @@ fn stop_recording(state: &AppState, _app: &tauri::AppHandle) -> Result<String, S
 
     // Set recording flag to false — polling thread will exit on next iteration
     state.is_recording.store(false, Ordering::SeqCst);
+
+    // Restore normal tray icon
+    if let Some(tray) = app.tray_by_id("main_tray") {
+        let normal = tauri::image::Image::from_bytes(
+            include_bytes!("../icons/OwlHead-EyesHatOnly.png"),
+        )
+        .expect("icon");
+        let _ = tray.set_icon(Some(normal));
+        let _ = tray.set_icon_as_template(true);
+    }
 
     // Brief sleep to let the polling thread pick up any final flushed results
     // before we drain the channel here (for AX insertion path)
@@ -552,6 +581,12 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
     spawn_transcription_polling_thread(state, app.clone());
     debug!("Transcription polling thread spawned");
     
+    // Switch tray icon to red recording indicator
+    if let Some(tray) = app.tray_by_id("main_tray") {
+        let _ = tray.set_icon(Some(create_recording_icon()));
+        let _ = tray.set_icon_as_template(false);
+    }
+
     info!("Recording started successfully");
     debug!("=== START RECORDING COMPLETED ===");
     Ok(())
@@ -882,8 +917,9 @@ pub fn run() {
 
             // Create system tray with custom icon
             let icon_bytes = include_bytes!("../icons/OwlHead-EyesHatOnly.png");
-            let _tray = tauri::tray::TrayIconBuilder::new()
+            let _tray = tauri::tray::TrayIconBuilder::with_id("main_tray")
                 .icon(tauri::image::Image::from_bytes(icon_bytes)?)
+                .icon_as_template(true)
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     debug!("Tray menu event received: {:?}", event.id());

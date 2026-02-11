@@ -80,9 +80,9 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     }
   };
 
-  const handleModeIdxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleModeIdxChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
     if (settings) {
-      setSettings({ ...settings, mode_idx: parseInt(event.target.value) || 0 });
+      setSettings({ ...settings, mode_idx: parseInt(event.target.value) });
     }
   };
 
@@ -133,15 +133,18 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
               {/* Streaming Mode */}
               <div className="settings-section">
                 <label htmlFor="mode-idx-input">Streaming Mode:</label>
-                <input
+                <select
                   id="mode-idx-input"
-                  type="number"
-                  min="0"
                   value={settings.mode_idx}
                   onChange={handleModeIdxChange}
-                />
+                >
+                  <option value={0}>Balanced (1.1s chunks)</option>
+                  <option value={1}>Faster (0.6s chunks)</option>
+                  <option value={2}>Low Latency (0.16s chunks)</option>
+                  <option value={3}>Realtime (0.08s chunks)</option>
+                </select>
                 <p className="help-text">
-                  Streaming mode index (0 = default). Higher modes may have different latency/accuracy tradeoffs.
+                  Lower latency responds faster but may reduce accuracy.
                 </p>
               </div>
 
