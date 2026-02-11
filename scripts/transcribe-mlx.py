@@ -17,7 +17,7 @@ from mlx_audio.stt.utils import load_model
 SAMPLE_RATE = 16000  # Parakeet expects 16kHz audio
 CHUNK_DURATION = 10.0  # Process audio in 10-second chunks
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
-OVERLAP_DURATION = 9.9  # Overlap between chunks for continuity
+OVERLAP_DURATION = 9.5  # Overlap between chunks for continuity
 OVERLAP_SIZE = int(SAMPLE_RATE * OVERLAP_DURATION)
 
 # Model configuration

@@ -774,9 +774,10 @@ pub fn run() {
             debug!("Menu built successfully");
             debug!("Creating tray icon...");
 
-            // Create system tray with icon
+            // Create system tray with custom icon
+            let icon_bytes = include_bytes!("../icons/OwlHead-EyesHatOnly.png");
             let _tray = tauri::tray::TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tauri::image::Image::from_bytes(icon_bytes)?)
                 .menu(&menu)
                 .on_menu_event(|app, event| {
                     debug!("Tray menu event received: {:?}", event.id());
