@@ -7,8 +7,9 @@ use crate::asr::audio::{AudioRecorder, DeviceId};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Settings {
-    pub model: String,
-    pub language: Option<String>,
+    pub model_path: String,
+    #[serde(default)]
+    pub mode_idx: usize,
     #[serde(default)]
     pub device_id: DeviceId,
 }
@@ -16,8 +17,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model: "tiny.en".to_string(),
-            language: None,
+            model_path: "/Users/jokr/work/mlx-nemo-rs/models/animaslabs/nemotron-speech-streaming-en-0.6b-mlx-8bit".to_string(),
+            mode_idx: 0,
             device_id: DeviceId::SystemDefault,
         }
     }
@@ -116,16 +117,16 @@ mod tests {
     #[test]
     fn test_default_settings() {
         let settings = Settings::default();
-        assert_eq!(settings.model, "tiny.en");
-        assert_eq!(settings.language, None);
+        assert!(!settings.model_path.is_empty());
+        assert_eq!(settings.mode_idx, 0);
         assert_eq!(settings.device_id, DeviceId::SystemDefault);
     }
 
     #[test]
     fn test_settings_serialization() {
         let settings = Settings {
-            model: "tiny.en".to_string(),
-            language: Some("en".to_string()),
+            model_path: "/some/path/to/model".to_string(),
+            mode_idx: 1,
             device_id: DeviceId::SystemDefault,
         };
 
@@ -154,8 +155,8 @@ mod tests {
 
         // Create custom settings
         let settings = Settings {
-            model: "base.en".to_string(),
-            language: Some("en".to_string()),
+            model_path: "/some/path/to/model".to_string(),
+            mode_idx: 1,
             device_id: DeviceId::Specific {
                 value: "Test Microphone".to_string(),
             },
@@ -224,32 +225,30 @@ mod tests {
     #[test]
     fn test_get_device_name_system_default() {
         let settings = Settings {
-            model: "tiny.en".to_string(),
-            language: None,
             device_id: DeviceId::SystemDefault,
+            ..Default::default()
         };
-        
+
         assert_eq!(settings.get_device_name(), "System Default");
     }
 
     #[test]
     fn test_get_device_name_specific() {
         let settings = Settings {
-            model: "tiny.en".to_string(),
-            language: None,
             device_id: DeviceId::Specific {
                 value: "USB Microphone".to_string(),
             },
+            ..Default::default()
         };
-        
+
         assert_eq!(settings.get_device_name(), "USB Microphone");
     }
 
     #[test]
     fn test_settings_with_device_id_serialization() {
         let settings = Settings {
-            model: "tiny.en".to_string(),
-            language: Some("en".to_string()),
+            model_path: "/some/path".to_string(),
+            mode_idx: 0,
             device_id: DeviceId::Specific {
                 value: "MacBook Pro Microphone".to_string(),
             },
@@ -263,15 +262,14 @@ mod tests {
 
     #[test]
     fn test_settings_migration_from_old_format() {
-        // Old settings without device_id field
-        let old_json = r#"{"model":"tiny.en","language":null}"#;
-        
+        // Old settings without mode_idx or device_id field
+        let old_json = r#"{"model_path":"/some/path"}"#;
+
         let settings: Settings = serde_json::from_str(old_json).unwrap();
-        
-        // Should have default device_id
+
+        // Should have defaults for missing fields
         assert_eq!(settings.device_id, DeviceId::SystemDefault);
-        // Should preserve other fields
-        assert_eq!(settings.model, "tiny.en");
-        assert_eq!(settings.language, None);
+        assert_eq!(settings.mode_idx, 0);
+        assert_eq!(settings.model_path, "/some/path");
     }
 }

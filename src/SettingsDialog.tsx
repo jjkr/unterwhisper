@@ -9,8 +9,8 @@ interface DeviceId {
 }
 
 interface Settings {
-  model: string;
-  language: string | null;
+  model_path: string;
+  mode_idx: number;
   device_id: DeviceId;
 }
 
@@ -25,64 +25,6 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saveSuccess, setSaveSuccess] = useState(false);
-
-  // Available models
-  const models = [
-    'tiny.en',
-    'tiny',
-    'base.en',
-    'base',
-    'small.en',
-    'small',
-    'medium.en',
-    'medium',
-    'large-v2',
-    'large-v3',
-    'large-v3-turbo',
-    'large-v3-turbo-q41-gguf',
-    'large-v3-turbo-q4k-gguf',
-    'distil-small.en',
-    'distil-medium.en',
-    'distil-large-v3',
-    'distil-large-v3.5',
-    'parakeet-tdt-0.6b-v3',
-    'moonshine-tiny',
-    'moonshine-base',
-    // ONNX models
-    'tiny-onnx',
-    'tiny.en-onnx',
-    'tiny.en-uint8-onnx',
-    'tiny.en-merged-uint8-onnx',
-    'small-onnx',
-    'small.en-onnx',
-    'medium-onnx',
-    'medium.en-onnx',
-    'medium.en-uint8-onnx',
-    'distil-small.en-onnx',
-    'distil-small.en-quantized-onnx',
-    'distil-small.en-merged-quantized-onnx',
-    'distil-medium.en-onnx',
-    'distil-medium.en-quantized-onnx',
-    'distil-medium.en-merged-quantized-onnx',
-    'distil-large-v3-onnx',
-    'distil-large-v3.5-onnx',
-    'parakeet-tdt-0.6b-v3-onnx',
-  ];
-
-  // Available languages (null means auto-detect)
-  const languages = [
-    { value: null, label: 'Auto-detect' },
-    { value: 'en', label: 'English' },
-    { value: 'es', label: 'Spanish' },
-    { value: 'fr', label: 'French' },
-    { value: 'de', label: 'German' },
-    { value: 'it', label: 'Italian' },
-    { value: 'pt', label: 'Portuguese' },
-    { value: 'nl', label: 'Dutch' },
-    { value: 'ja', label: 'Japanese' },
-    { value: 'zh', label: 'Chinese' },
-    { value: 'ko', label: 'Korean' },
-  ];
 
   useEffect(() => {
     if (isOpen) {
@@ -132,16 +74,15 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
     }
   };
 
-  const handleModelChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+  const handleModelPathChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (settings) {
-      setSettings({ ...settings, model: event.target.value });
+      setSettings({ ...settings, model_path: event.target.value });
     }
   };
 
-  const handleLanguageChange = (event: React.ChangeEvent<HTMLSelectElement>) => {
+  const handleModeIdxChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (settings) {
-      const value = event.target.value === '' ? null : event.target.value;
-      setSettings({ ...settings, language: value });
+      setSettings({ ...settings, mode_idx: parseInt(event.target.value) || 0 });
     }
   };
 
@@ -175,41 +116,32 @@ export function SettingsDialog({ isOpen, onClose }: SettingsDialogProps) {
                 />
               </div>
 
-              {/* Model Selection */}
+              {/* Model Path */}
               <div className="settings-section">
-                <label htmlFor="model-select">Model:</label>
-                <select
-                  id="model-select"
-                  value={settings.model}
-                  onChange={handleModelChange}
-                >
-                  {models.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </select>
+                <label htmlFor="model-path-input">Model Path:</label>
+                <input
+                  id="model-path-input"
+                  type="text"
+                  value={settings.model_path}
+                  onChange={handleModelPathChange}
+                />
                 <p className="help-text">
-                  Smaller models are faster but less accurate. Larger models are more accurate but slower.
+                  Path to a .nemo model file or MLX model directory.
                 </p>
               </div>
 
-              {/* Language Selection */}
+              {/* Streaming Mode */}
               <div className="settings-section">
-                <label htmlFor="language-select">Language:</label>
-                <select
-                  id="language-select"
-                  value={settings.language || ''}
-                  onChange={handleLanguageChange}
-                >
-                  {languages.map((lang) => (
-                    <option key={lang.value || 'auto'} value={lang.value || ''}>
-                      {lang.label}
-                    </option>
-                  ))}
-                </select>
+                <label htmlFor="mode-idx-input">Streaming Mode:</label>
+                <input
+                  id="mode-idx-input"
+                  type="number"
+                  min="0"
+                  value={settings.mode_idx}
+                  onChange={handleModeIdxChange}
+                />
                 <p className="help-text">
-                  Select a language for better accuracy, or use auto-detect.
+                  Streaming mode index (0 = default). Higher modes may have different latency/accuracy tradeoffs.
                 </p>
               </div>
 

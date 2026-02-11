@@ -1,4 +1,3 @@
-use candle_core::Device;
 use global_hotkey::{GlobalHotKeyManager, GlobalHotKeyEvent, hotkey::{Code, HotKey, Modifiers}, HotKeyState};
 use log::{debug, info, error, warn};
 use tauri::{Manager, Emitter};
@@ -13,7 +12,7 @@ mod settings;
 mod asr;
 
 pub use settings::Settings;
-use asr::RealtimeTranscriber;
+use asr::NemoTranscriber;
 
 /// Check if accessibility permissions are granted on macOS
 #[cfg(target_os = "macos")]
@@ -51,8 +50,8 @@ fn check_microphone_permission() -> bool {
 
 /// Application state shared across Tauri commands and event handlers
 pub struct AppState {
-    /// The real-time transcriber instance (created once, reused)
-    pub transcriber: Arc<Mutex<Option<RealtimeTranscriber>>>,
+    /// The NeMo transcriber instance (created once, reused)
+    pub transcriber: Arc<Mutex<Option<NemoTranscriber>>>,
     
     /// Flag indicating whether recording is currently active
     pub is_recording: Arc<AtomicBool>,
@@ -78,28 +77,29 @@ impl AppState {
     /// Initialize the transcriber and settings
     pub fn initialize_with_settings(&self, settings: Settings) -> anyhow::Result<()> {
         info!("Initializing AppState with transcriber");
-        
+
+        // Always store settings first so user can change them via UI
+        {
+            let mut settings_guard = self.settings.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock settings: {}", e))?;
+            *settings_guard = Some(settings.clone());
+        }
+
         // Create transcriber config from settings
         let config = asr::TranscriberConfig {
-            model_name: settings.model.clone(),
-            language: settings.language.clone(),
-            ..Default::default()
+            model_path: settings.model_path.clone().into(),
+            mode_idx: settings.mode_idx,
         };
-        
+
         // Create transcriber once
-        let transcriber = RealtimeTranscriber::new(config)?;
-        
+        let transcriber = NemoTranscriber::new(config)?;
+
         info!("Transcriber created successfully");
-        
+
         {
             let mut transcriber_guard = self.transcriber.lock()
                 .map_err(|e| anyhow::anyhow!("Failed to lock transcriber: {}", e))?;
             *transcriber_guard = Some(transcriber);
-        }
-        {
-            let mut settings_guard = self.settings.lock()
-                .map_err(|e| anyhow::anyhow!("Failed to lock settings: {}", e))?;
-            *settings_guard = Some(settings);
         }
 
         info!("AppState initialized successfully");
@@ -109,16 +109,15 @@ impl AppState {
     /// Update the settings in the AppState
     pub fn update_settings(&self, new_settings: Settings) -> anyhow::Result<()> {
         info!("Updating AppState settings");
-        
+
         // Create transcriber config from settings
         let config = asr::TranscriberConfig {
-            model_name: new_settings.model.clone(),
-            language: new_settings.language.clone(),
-            ..Default::default()
+            model_path: new_settings.model_path.clone().into(),
+            mode_idx: new_settings.mode_idx,
         };
-        
+
         // Create a new transcriber
-        let transcriber = RealtimeTranscriber::new(config)?;
+        let transcriber = NemoTranscriber::new(config)?;
 
         {
             let mut transcriber_guard = self.transcriber.lock()
@@ -412,6 +411,29 @@ fn start_recording(state: &AppState, app: &tauri::AppHandle) -> anyhow::Result<(
             }
         }
     };
+
+    // Lazily initialize transcriber if it wasn't created at startup
+    {
+        let needs_init = state.transcriber.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock transcriber: {}", e))?
+            .is_none();
+        if needs_init {
+            info!("Transcriber not yet initialized, attempting lazy init...");
+            let settings = state.settings.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock settings: {}", e))?;
+            let settings = settings.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Settings not initialized"))?;
+            let config = asr::TranscriberConfig {
+                model_path: settings.model_path.clone().into(),
+                mode_idx: settings.mode_idx,
+            };
+            let transcriber = asr::NemoTranscriber::new(config)?;
+            let mut guard = state.transcriber.lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock transcriber: {}", e))?;
+            *guard = Some(transcriber);
+            info!("Transcriber lazily initialized");
+        }
+    }
 
     // Get transcriber and start it with the recorder
     debug!("Acquiring transcriber lock...");
@@ -736,16 +758,18 @@ pub fn run() {
                 warn!("Failed to load settings: {}. Using defaults.", e);
                 Settings::default()
             });
-            info!("Settings loaded: model={}, language={:?}", settings.model, settings.language);
+            info!("Settings loaded: model_path={}, mode_idx={}", settings.model_path, settings.mode_idx);
             
             // Initialize application state with transcriber
             info!("Initializing transcriber with settings...");
             let state = app.state::<AppState>();
-            state.initialize_with_settings(settings).map_err(|e| {
-                error!("Failed to initialize transcriber: {}", e);
-                e.to_string()
-            })?;
-            info!("Transcriber initialized successfully");
+            match state.initialize_with_settings(settings) {
+                Ok(()) => info!("Transcriber initialized successfully"),
+                Err(e) => {
+                    error!("Failed to initialize transcriber: {}. App will start without transcriber — fix the model path in Settings.", e);
+                    // Store settings even if transcriber fails, so user can fix via UI
+                }
+            }
 
             // Configure app to not show in dock on macOS
             app.set_activation_policy(tauri::ActivationPolicy::Prohibited);

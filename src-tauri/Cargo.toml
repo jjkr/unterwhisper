@@ -14,12 +14,6 @@ edition = "2021"
 name = "unterwhisper_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
-[features]
-default = ["metal"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
-accelerate = ["candle-core/accelerate", "candle-nn/accelerate", "candle-transformers/accelerate"]
-
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -39,21 +33,10 @@ dirs = "5.0"
 anyhow = "1.0"
 ringbuf = "0.4"
 crossbeam-channel = "0.5"
-bytemuck = "1.14"
-candle-core = { version = "0.9.1" }
-candle-transformers = "0.9.1"
-candle-nn = "0.9.1"
-clap = { version = "4.x", features = ["derive"] }
 cpal = "0.17"
-hf-hub = "0.4"
-num-complex = "0.4"
-rand = "0.8"
-realfft = "3.3"
 tracing = "0.1"
-tokenizers = "0.20"
 rubato = "0.16"
-ort = { version = "2.0.0-rc.10", features = ["coreml"] }
-ndarray = "0.16"
+mlx-nemo = { path = "../../mlx-nemo-rs" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility-sys = "0.1"
